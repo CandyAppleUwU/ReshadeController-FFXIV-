@@ -3224,8 +3224,8 @@ public class ConfigWindow : Window, IDisposable
             if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
                 ImGui.SetTooltip("select a dynamic preset first");
         }
-        else if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Drop undriven keys from the primary snapshot (backup first). Ticking later re-adopts.");
+            else if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Presets created in 0.9.315 might have a bloated primary key (every known shader tracked). Click this to trim it to driven keys only (backup first). Ticking later re-adopts.");
         if (!string.IsNullOrEmpty(trimStatus))
         {
             ImGui.SameLine();
