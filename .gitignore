@@ -4,6 +4,8 @@ obj/
 publish/
 XlPatcher/bin/
 XlPatcher/obj/
+# Compiled ReShade addon (build it with Addon\build.bat)
+*.addon
 
 # Visual Studio / Rider
 .vs/

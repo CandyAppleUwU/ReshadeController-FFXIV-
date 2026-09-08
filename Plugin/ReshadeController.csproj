@@ -20,12 +20,12 @@
     <PackageReference Include="ECommons" Version="3.2.0.6" />
   </ItemGroup>
 
-  <!-- XlPatcher + publish are ship vehicles living in this dir, not plugin
+  <!-- XlPatcher + publish are ship vehicles living in this repo, not plugin
        sources: keep their (generated) .cs out of the plugin compile. -->
   <ItemGroup>
-    <Compile Remove="XlPatcher\**" />
-    <None Remove="XlPatcher\**;publish\**" />
-    <EmbeddedResource Remove="XlPatcher\**" />
+    <Compile Remove="..\XlPatcher\**" />
+    <None Remove="..\XlPatcher\**;..\publish\**" />
+    <EmbeddedResource Remove="..\XlPatcher\**" />
   </ItemGroup>
 
   <ItemGroup>
