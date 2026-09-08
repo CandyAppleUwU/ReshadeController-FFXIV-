@@ -1315,27 +1315,35 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         // Paused shaders hold outputs (panels + signal files) while the sim
         // keeps ticking underneath, so resume picks up the current state
         // instead of replaying stale frames. Toggle signals already gate
-        // themselves inside FlushDynamicToggles.
-        if (dynData != null && !IsPaused)
+        // themselves inside FlushDynamicToggles. Mirror only feeds panels,
+        // so skip it with the window closed (re-mirrors on reopen).
+        if (dynData != null && !IsPaused && this.configWindow.IsOpen)
             this.configWindow.MirrorDynamicState(mirroredUniforms, mirroredToggles);
         // Snapshot for next frame's time fade (blend-from values +
         // base-only provenance). Kept across frozen frames so re-ON still
-        // ramps from pre-freeze.
+        // ramps from pre-freeze. Reference-assign: nothing mutates these
+        // dicts after this point until the next build re-news them.
         try
         {
             if (mirroredUniforms.Count > 0)
             {
-                _prevMirrored = new Dictionary<string, string>(mirroredUniforms, StringComparer.OrdinalIgnoreCase);
-                _prevBaseOnly = new Dictionary<string, bool>(_curBaseFlags, StringComparer.OrdinalIgnoreCase);
+                _prevMirrored = mirroredUniforms;
+                _prevBaseOnly = _curBaseFlags;
             }
             if (mirroredToggles != null && mirroredToggles.Count > 0)
-                _prevToggles = new Dictionary<string, bool>(mirroredToggles, StringComparer.OrdinalIgnoreCase);
+                _prevToggles = mirroredToggles;
         }
         catch { }
         var combined = legacy + dynamic;
         if (IsPaused) return; // hold outputs (see above): touch neither the file nor the change gate
         if (combined == _lastAnimContent) return; // don't rewrite (and tear) an identical file every frame
+        // Render-thread relief: values move every frame while time runs, so
+        // the change gate alone never holds. Cap file writes at ~40Hz; the
+        // gate still compares against the last WRITTEN content so nothing
+        // ever goes stale (throttled frames return WITHOUT updating it).
+        if ((DateTime.UtcNow - _lastAnimWrite).TotalMilliseconds < 25) return;
         _lastAnimContent = combined;
+        _lastAnimWrite = DateTime.UtcNow;
         try
         {
             var animFile = GetAnimationSignalPath();
@@ -1354,6 +1362,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     }
 
     private string _lastAnimContent = "\0";
+    private DateTime _lastAnimWrite = DateTime.MinValue;
 
     private string BuildLegacyAnimContent(int eorzeaSeconds)
     {
@@ -3509,13 +3518,16 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         return "int";
     }
 
+    private static readonly System.Text.RegularExpressions.Regex ProtoNumsRx =
+        new(@"\(([^)]+)\)", System.Text.RegularExpressions.RegexOptions.Compiled);
+
     private static string DynLerpValue(DynamicUniformValue a, DynamicUniformValue b, float t)
     {
         string proto = DynProtoType(string.IsNullOrEmpty(a.BaseType) ? b.BaseType : a.BaseType);
         var inv = System.Globalization.CultureInfo.InvariantCulture;
         float[] ParseNums(string s)
         {
-            var m = System.Text.RegularExpressions.Regex.Match(s ?? "", @"\(([^)]+)\)");
+            var m = ProtoNumsRx.Match(s ?? "");
             string raw = m.Success ? m.Groups[1].Value : (s ?? "");
             var parts = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             var nums = new float[parts.Length];
@@ -3859,6 +3871,20 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             }
         }
         catch { }
+        // Per-frame daylight hoists: the global brightness position and the
+        // per-segment normalization scans are identical for every key, so
+        // compute once instead of per key (96 + 64 bin samples each).
+        float pairGlobalF = float.NaN;
+        Dictionary<(int t0, int t1), (float mn, float mx)>? segDlCache = null;
+        try
+        {
+            if (segCurve == 2 && segDaylight != null && segDaylight.Values != null && segDaylight.Values.Count > 0)
+            {
+                segDlCache = new Dictionary<(int t0, int t1), (float mn, float mx)>();
+                if (frames.Count == 2) pairGlobalF = DynamicTimeline.DaylightGlobalFactor(segDaylight, eorzeaSeconds);
+            }
+        }
+        catch { pairGlobalF = float.NaN; segDlCache = null; }
         // Keys with a live driver this frame (non-primary carrier, manual
         // grab, or trigger envelope). Fade-out yields to all of these.
         var liveKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -3972,7 +3998,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             // night look on the earlier keyframe. Longer chains and
             // primary-shared keys keep per-segment pacing.
             bool isPair = segCurve == 2 && frames.Count == 2 && carriers.Count == 2;
-            float t = DynamicTimeline.SegmentFactor(pc.TimeSeconds, nc.TimeSeconds, eorzeaSeconds, segCurve, segDaylight, isPair);
+            float t = DynamicTimeline.SegmentFactor(pc.TimeSeconds, nc.TimeSeconds, eorzeaSeconds, segCurve, segDaylight, isPair, segDlCache);
             // Pair upgrade: both chain frames define this key, so they own it
             // outright by global brightness position — even when the pooled
             // primary also carries it (it otherwise owns the wrap hours and
@@ -3985,7 +4011,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 {
                     var e0 = StoredUniform(cf0, file, uname);
                     var e1 = StoredUniform(cf1, file, uname);
-                    float pf = DynamicTimeline.DaylightGlobalFactor(segDaylight, eorzeaSeconds);
+                    float pf = pairGlobalF;
                     if (e0 != null && e1 != null && !float.IsNaN(pf))
                     {
                         bool swap = cf0.TimeSeconds > cf1.TimeSeconds;

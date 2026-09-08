@@ -614,7 +614,8 @@ public static class DynamicTimeline
     public static float SegmentFactor(int t0, int t1, int now)
         => SegmentFactor(t0, t1, now, 0, null);
 
-    public static float SegmentFactor(int t0, int t1, int now, int curveMode, DynamicDaylight? dl, bool dayNightPair = false)
+    public static float SegmentFactor(int t0, int t1, int now, int curveMode, DynamicDaylight? dl, bool dayNightPair = false,
+        Dictionary<(int t0, int t1), (float mn, float mx)>? dlCache = null)
     {
         int span = (t1 - t0 + 86400) % 86400;
         if (span == 0) return 0;
@@ -629,12 +630,22 @@ public static class DynamicTimeline
                 // position between GLOBAL extrema, not segment position.
                 // 0 shows the earlier keyframe (night look by convention),
                 // 1 the later (day look). Continuous across the wrap
-                // boundary, so nothing ever snaps.
+                // boundary, so nothing ever snaps. Extrema come from the
+                // per-frame cache (sentinel key) when provided so hundreds
+                // of keys don't each scan all bins.
                 float gmn = float.MaxValue, gmx = float.MinValue;
-                foreach (var s in dl.Values)
+                if (dlCache != null && dlCache.TryGetValue((int.MinValue, int.MinValue), out var gmm))
                 {
-                    if (s < gmn) gmn = s;
-                    if (s > gmx) gmx = s;
+                    gmn = gmm.mn; gmx = gmm.mx;
+                }
+                else
+                {
+                    foreach (var s in dl.Values)
+                    {
+                        if (s < gmn) gmn = s;
+                        if (s > gmx) gmx = s;
+                    }
+                    dlCache?.Add((int.MinValue, int.MinValue), (gmn, gmx));
                 }
                 if (gmx - gmn < 1e-6f) return p;
                 float gv = SampleDaylight(dl.Values, ((now % 86400) + 86400) % 86400);
@@ -644,14 +655,24 @@ public static class DynamicTimeline
             float te = (t0 + p * span) % 86400;
             float v = SampleDaylight(dl.Values, te);
             // Normalize over THIS segment so it still traverses full A->B:
-            // flat stretches hold still, steep stretches rush.
+            // flat stretches hold still, steep stretches rush. The scan is
+            // cached per (t0,t1) for the frame: every key on the same
+            // segment shares it instead of re-scanning 64 samples.
             float mn = float.MaxValue, mx = float.MinValue;
-            const int N = 64;
-            for (int i = 0; i <= N; i++)
+            if (dlCache != null && dlCache.TryGetValue((t0, t1), out var smm))
             {
-                float s = SampleDaylight(dl.Values, (t0 + span * i / (float)N) % 86400);
-                if (s < mn) mn = s;
-                if (s > mx) mx = s;
+                mn = smm.mn; mx = smm.mx;
+            }
+            else
+            {
+                const int N = 64;
+                for (int i = 0; i <= N; i++)
+                {
+                    float s = SampleDaylight(dl.Values, (t0 + span * i / (float)N) % 86400);
+                    if (s < mn) mn = s;
+                    if (s > mx) mx = s;
+                }
+                dlCache?.Add((t0, t1), (mn, mx));
             }
             if (mx - mn < 1e-6f) return p;
             return Math.Clamp((v - mn) / (mx - mn), 0f, 1f);
