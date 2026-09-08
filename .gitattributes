@@ -1,0 +1,10 @@
+* text=auto
+*.fx text eol=lf
+*.fxh text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.sln text eol=crlf
+*.csproj text eol=crlf
+*.dll binary
+*.exe binary
+*.pdb binary

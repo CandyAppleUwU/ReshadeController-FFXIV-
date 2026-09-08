@@ -1,0 +1,26 @@
+# Build outputs
+bin/
+obj/
+publish/
+XlPatcher/bin/
+XlPatcher/obj/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Dalamud dev artifacts
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store
