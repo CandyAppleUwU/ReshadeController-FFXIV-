@@ -22,6 +22,9 @@ XlPatcher/obj/
 __pycache__/
 *.pyc
 
+# Release zips (uploaded to GitHub Releases, not stored in git)
+dist/
+
 # OS noise
 Thumbs.db
 Desktop.ini
