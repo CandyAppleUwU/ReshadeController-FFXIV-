@@ -4188,6 +4188,18 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                     _curBaseFlags[key] = false;
                     liveKeys.Add(key);
                 }
+                // Manual override with no other carrier (e.g. trimmed-away
+                // base): emit it directly, exactly as the old full-primary
+                // path did (override wins outright, flagged base-driven).
+                else if (this.configWindow.DynOverrideUniforms.TryGetValue(key, out var ov2))
+                {
+                    string proto2 = DynProtoType(ov2.BaseType);
+                    if (!deltaOk || forceFullFrame || EmitChangedLine(key, ov2.Value))
+                        sb.AppendLine($"{file}|{uname}|{proto2}|{ov2.Value}");
+                    mirrored[key] = ov2.Value;
+                    _curBaseFlags[key] = true;
+                    liveKeys.Add(key);
+                }
                 continue;
             }
             // Twins (same TimeSeconds, e.g. chain frame + pooled primary at

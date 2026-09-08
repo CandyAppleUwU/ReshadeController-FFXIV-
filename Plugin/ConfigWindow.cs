@@ -741,6 +741,7 @@ public class ConfigWindow : Window, IDisposable
 
     private string daylightCsvPath = "";
     private string daylightStatus = "";
+    private string trimStatus = "";
 
     // Merge a recorder CSV (needs the eorzea_s column from --eorzea-file)
     // into per-Eorzea-time bins, smooth, and store in the GLOBAL daylight
@@ -1898,6 +1899,9 @@ public class ConfigWindow : Window, IDisposable
             activeDynPath = presetPath;
             sidecarDirty = false;
             lastSidecarSave = DateTime.UtcNow;
+            // Fresh snapshots start trimmed (ON techs, zero uniforms);
+            // ticking later adopts driven keys (see tick setters).
+            try { TrimPrimaryToDriven(); } catch { }
         }
         catch { }
     }
@@ -2152,6 +2156,11 @@ public class ConfigWindow : Window, IDisposable
                 SplitTechKey(techKey, out var ttech, out var tfile);
                 WriteToggleSignal(tfile, ttech, pv);
             }
+            // Adopt into primary base if absent (trimmed primaries must
+            // gain every newly-driven key; existing bases are history).
+            var pkA = PrimaryKeyframe();
+            if (pkA != null && !pkA.TechStates.ContainsKey(techKey) && kf.TechStates.TryGetValue(techKey, out bool adopted))
+                pkA.TechStates[techKey] = adopted;
         }
         else
         {
@@ -2187,6 +2196,15 @@ public class ConfigWindow : Window, IDisposable
             if (!kf.Uniforms.TryGetValue(effectFile, out var umap))
                 kf.Uniforms[effectFile] = umap = new Dictionary<string, DynamicUniformValue>(StringComparer.OrdinalIgnoreCase);
             umap[uniName] = new DynamicUniformValue { Value = start, BaseType = baseType };
+            // Adopt into primary base if absent (see SetTechTick).
+            var pkU = PrimaryKeyframe();
+            if (pkU != null && umap.TryGetValue(uniName, out var adoptedUv))
+            {
+                if (!pkU.Uniforms.TryGetValue(effectFile, out var pkmap))
+                    pkU.Uniforms[effectFile] = pkmap = new Dictionary<string, DynamicUniformValue>(StringComparer.OrdinalIgnoreCase);
+                if (!pkmap.ContainsKey(uniName))
+                    pkmap[uniName] = new DynamicUniformValue { Value = adoptedUv.Value, BaseType = adoptedUv.BaseType };
+            }
             if (!IsEngineDriving() && pvU != null)
             {
                 if (!effectSettings.TryGetValue(effectFile, out var sm2))
@@ -2248,6 +2266,86 @@ public class ConfigWindow : Window, IDisposable
     {
         var pk = PrimaryKeyframe();
         return pk != null && pk.TechStates.TryGetValue(techKey, out bool v) && v;
+    }
+
+    // Trim primary to driven keys: keep a tech iff ON anywhere (any
+    // keyframe, or live now — covers .ini-ON-but-sidecar-OFF), keep a
+    // uniform iff ticked in any keyframe. Values: stored first, else live
+    // panel state, else dropped. Undriven output vanishes (the addon holds
+    // preset values, identical screen); ticking later re-adopts via the
+    // tick setters below. Backup first; returns counts for status.
+    private (int techs, int unis) TrimPrimaryToDriven()
+    {
+        var dd = activeDynData;
+        if (dd == null) return (0, 0);
+        var pk = PrimaryKeyframe();
+        if (pk == null) return (0, 0);
+        var onTech = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var tickedTech = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var tickedUni = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in dd.Configs)
+            foreach (var k in c.Keyframes)
+            {
+                foreach (var kvp in k.TechStates) if (kvp.Value) onTech.Add(kvp.Key);
+                foreach (var t in k.TickedTechs) tickedTech.Add(t);
+                foreach (var u in k.TickedUniforms) tickedUni.Add(u);
+            }
+        foreach (var kvp in effectEnabledState) if (kvp.Value) onTech.Add(kvp.Key);
+        int dropT = 0, dropU = 0;
+        foreach (var k in pk.TechStates.Keys.ToList())
+        {
+            if (onTech.Contains(k) || tickedTech.Contains(k)) continue;
+            pk.TechStates.Remove(k);
+            dropT++;
+        }
+        // Seed kept-but-absent techs from live (trim of an older trim).
+        foreach (var k in onTech)
+        {
+            if (pk.TechStates.ContainsKey(k)) continue;
+            if (effectEnabledState.TryGetValue(k, out bool en) && en) pk.TechStates[k] = true;
+        }
+        foreach (var f in pk.Uniforms.Keys.ToList())
+        {
+            var m = pk.Uniforms[f];
+            foreach (var u in m.Keys.ToList())
+            {
+                string kk = f + "\0" + u;
+                if (tickedUni.Contains(kk)) continue;
+                m.Remove(u);
+                dropU++;
+            }
+            if (m.Count == 0) pk.Uniforms.Remove(f);
+        }
+        // Seed kept-but-absent uniforms from live panels.
+        foreach (var k in tickedUni)
+        {
+            int s = k.IndexOf('\0');
+            if (s < 0) continue;
+            var f = k.Substring(0, s);
+            var u = k.Substring(s + 1);
+            if (pk.Uniforms.TryGetValue(f, out var m) && m.ContainsKey(u)) continue;
+            if (effectSettings.TryGetValue(f, out var sm) && sm.TryGetValue(u, out var lv))
+            {
+                if (!pk.Uniforms.TryGetValue(f, out var m2))
+                    pk.Uniforms[f] = m2 = new Dictionary<string, DynamicUniformValue>(StringComparer.OrdinalIgnoreCase);
+                m2[u] = new DynamicUniformValue { Value = lv, BaseType = UniformBaseType(f, u) };
+            }
+        }
+        SaveActiveDyn();
+        return (dropT, dropU);
+    }
+
+    private string UniformBaseType(string effectFile, string uniName)
+    {
+        try
+        {
+            if (effectUniforms.TryGetValue(effectFile, out var ul))
+                foreach (var u in ul)
+                    if (string.Equals(u.Name, uniName, StringComparison.OrdinalIgnoreCase))
+                        return string.IsNullOrEmpty(u.BaseType) ? "float" : u.BaseType;
+        }
+        catch { }
+        return "float";
     }
 
     // Display value for the settings panel: live, unless a keyframe is
@@ -3090,6 +3188,47 @@ public class ConfigWindow : Window, IDisposable
                     if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
                         ImGui.SetTooltip("already exists with that name");
                 }
+            }
+            // Trim primary to driven keys (see TrimPrimaryToDriven): drops
+            // everything no keyframe drives from the base snapshot, with a
+            // backup. Only for dynamic presets with a loaded sidecar.
+            bool canTrim = alreadyDynamic && activeDynData != null;
+            if (!canTrim) ImGui.BeginDisabled();
+            ImGui.SameLine();
+            if (ImGui.Button("Trim Primary"))
+            {
+                try
+                {
+                    EnsureDynCache();
+                    if (activeDynData == null || !string.Equals(activeDynPath, selectedPresetPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        trimStatus = "Sidecar not loaded for this preset — reselect it first.";
+                    }
+                    else
+                    {
+                        if (!string.IsNullOrEmpty(selectedPresetPath))
+                        {
+                            var sc = DynamicPresetStore.SidecarPath(selectedPresetPath);
+                            if (File.Exists(sc)) File.Copy(sc, sc + ".trimbak", true);
+                        }
+                        var (dt2, du2) = TrimPrimaryToDriven();
+                        trimStatus = $"Trimmed {dt2} toggles, {du2} uniforms from primary (backup .trimbak).";
+                    }
+                }
+                catch (Exception ex) { try { trimStatus = "Trim failed: " + ex.Message; } catch { } }
+            }
+            if (!canTrim)
+            {
+                ImGui.EndDisabled();
+                if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    ImGui.SetTooltip("select a dynamic preset first");
+            }
+            else if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Drop undriven keys from the primary snapshot (backup first). Ticking later re-adopts.");
+            if (!string.IsNullOrEmpty(trimStatus))
+            {
+                ImGui.SameLine();
+                ImGui.TextDisabled(trimStatus);
             }
         }
         DrawPresetNameModal();
