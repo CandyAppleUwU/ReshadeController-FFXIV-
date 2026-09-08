@@ -2177,6 +2177,25 @@ public class ConfigWindow : Window, IDisposable
                 SplitTechKey(techKey, out var ttech, out var tfile);
                 WriteToggleSignal(tfile, ttech, pst);
             }
+            // Drop from primary when nothing drives it anymore (off and
+            // unticked everywhere): values nobody needs aren't stored.
+            // Panel toggles are untouched (they still drive triggers).
+            if (!TechDrivenAnywhere(techKey) && PrimaryKeyframe() is DynamicKeyframe pkDrop)
+            {
+                var existingT = pkDrop.TechStates.Keys.FirstOrDefault(k => string.Equals(k, techKey, StringComparison.OrdinalIgnoreCase));
+                if (existingT != null) pkDrop.TechStates.Remove(existingT);
+            }
+            // File uniforms unticked above cascade the same way.
+            if (PrimaryKeyframe() is DynamicKeyframe pkFiles)
+            {
+                SplitTechKey(techKey, out var dropTech, out var dropFile);
+                if (pkFiles.Uniforms.TryGetValue(dropFile, out var dropMap))
+                {
+                    foreach (var du in dropMap.Keys.ToList())
+                        if (!UniformTickedAnywhere(dropFile, du)) dropMap.Remove(du);
+                    if (dropMap.Count == 0) pkFiles.Uniforms.Remove(dropFile);
+                }
+            }
         }
         SaveActiveDyn();
     }
@@ -2250,11 +2269,54 @@ public class ConfigWindow : Window, IDisposable
                 sm[uniName] = pv;
                 MarkDirtyUniform(effectFile, uniName, baseType, pv);
             }
+            // Drop from primary when nothing ticks it anymore (see techs).
+            if (!UniformTickedAnywhere(effectFile, uniName) && PrimaryKeyframe() is DynamicKeyframe pkDropU)
+            {
+                foreach (var fk in pkDropU.Uniforms.Keys.ToList())
+                {
+                    if (!string.Equals(fk, effectFile, StringComparison.OrdinalIgnoreCase)) continue;
+                    var dropMapU = pkDropU.Uniforms[fk];
+                    var existingU = dropMapU.Keys.FirstOrDefault(k => string.Equals(k, uniName, StringComparison.OrdinalIgnoreCase));
+                    if (existingU != null) dropMapU.Remove(existingU);
+                    if (dropMapU.Count == 0) pkDropU.Uniforms.Remove(fk);
+                }
+            }
         }
         SaveActiveDyn();
     }
 
     // Primary (full base) for display fallback on unticked sparse rows.
+    // Trim helpers: is a key driven anywhere (ticked or ON in any
+    // keyframe)? Unknown (no data) counts as driven = keep (safe).
+    private bool TechDrivenAnywhere(string techKey)
+    {
+        try
+        {
+            if (activeDynData == null) return true;
+            foreach (var c in activeDynData.Configs)
+                foreach (var k in c.Keyframes)
+                {
+                    if (k.TickedTechs.Any(t => string.Equals(t, techKey, StringComparison.OrdinalIgnoreCase))) return true;
+                    if (k.TechStates.TryGetValue(techKey, out bool v) && v) return true;
+                }
+        }
+        catch { return true; }
+        return false;
+    }
+
+    private bool UniformTickedAnywhere(string effectFile, string uniName)
+    {
+        try
+        {
+            if (activeDynData == null) return true;
+            foreach (var c in activeDynData.Configs)
+                foreach (var k in c.Keyframes)
+                    if (k.TickedUniforms.Any(u => string.Equals(u, effectFile + "\0" + uniName, StringComparison.OrdinalIgnoreCase))) return true;
+        }
+        catch { return true; }
+        return false;
+    }
+
     private DynamicKeyframe? PrimaryKeyframe()
     {
         var cfg = activeDynData?.GetConfig("Primary") ?? activeDynData?.Configs.FirstOrDefault();
