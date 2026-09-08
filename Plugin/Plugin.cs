@@ -3510,6 +3510,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             _lastSentDynToggles[kvp.Key] = kvp.Value;
     }
 
+    private static readonly Comparison<DynamicKeyframe> ByKeyframeTime =
+        (x, y) => x.TimeSeconds.CompareTo(y.TimeSeconds);
+
     private static string DynProtoType(string baseType)
     {
         if (baseType.StartsWith("float", StringComparison.OrdinalIgnoreCase)
@@ -3525,6 +3528,24 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     {
         string proto = DynProtoType(string.IsNullOrEmpty(a.BaseType) ? b.BaseType : a.BaseType);
         var inv = System.Globalization.CultureInfo.InvariantCulture;
+        // Scalar fast path: most uniforms are single numbers. Byte-identical
+        // to the slow path below (same F4/round formatting, same bool
+        // threshold); anything else falls through.
+        string av0 = a.Value ?? "", bv0 = b.Value ?? "";
+        if (av0.IndexOf(',') < 0 && bv0.IndexOf(',') < 0 && av0.IndexOf('(') < 0 && bv0.IndexOf('(') < 0
+            && float.TryParse(av0, System.Globalization.NumberStyles.Float, inv, out float fa0)
+            && float.TryParse(bv0, System.Globalization.NumberStyles.Float, inv, out float fb0))
+        {
+            float v0 = fa0 + (fb0 - fa0) * t;
+            if (proto != "float")
+            {
+                if (a.BaseType.StartsWith("bool", StringComparison.OrdinalIgnoreCase)
+                    || b.BaseType.StartsWith("bool", StringComparison.OrdinalIgnoreCase))
+                    return v0 > 0.5f ? "1" : "0";
+                return ((int)Math.Round(v0)).ToString(inv);
+            }
+            return v0.ToString("F4", inv);
+        }
         float[] ParseNums(string s)
         {
             var m = ProtoNumsRx.Match(s ?? "");
@@ -3535,8 +3556,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 float.TryParse(parts[i], System.Globalization.NumberStyles.Float, inv, out nums[i]);
             return nums;
         }
-        var na = ParseNums(a.Value);
-        var nb = ParseNums(b.Value);
+        var na = ParseNums(a.Value ?? "");
+        var nb = ParseNums(b.Value ?? "");
         int count = Math.Max(Math.Max(na.Length, nb.Length), 1);
         var outVals = new string[count];
         for (int i = 0; i < count; i++)
@@ -3855,6 +3876,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         var pool = new List<DynamicKeyframe>(frames);
         if (primary != null && !pool.Any(f => f.Id == primary.Id)) pool.Add(primary);
         bool hasPrimary = primary != null;
+        // Time order once per build: carriers below stay sorted without a
+        // per-key OrderBy (identical order to the old filter+sort).
+        pool.Sort(ByKeyframeTime);
         var fadeByFrame = TimeFadeFactors(data);
         // Chain-start transfer function for segment blending (CurveMode on
         // the walk head; 24H Brightness Curve needs sidecar data). Hoisted:
@@ -3891,7 +3915,19 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
         var sb = new StringBuilder();
         _curBaseFlags = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        // Key universe, split once: the main loop needs (key, file, uname)
+        // and re-splitting every key every frame showed up hot. Override and
+        // overlay keys (few) split once at insert.
         var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var keyParts = new List<(string key, string file, string uname)>();
+        void AddKey(string k, string f, string u) { if (keys.Add(k)) keyParts.Add((k, f, u)); }
+        void AddKeySplit(string k)
+        {
+            if (!keys.Add(k)) return;
+            int s = k.IndexOf('\0');
+            if (s < 0) return;
+            keyParts.Add((k, k.Substring(0, s), k.Substring(s + 1)));
+        }
         foreach (var f in pool)
         {
             bool full = !hasPrimary || f.IsPrimary || !f.Sparse;
@@ -3899,32 +3935,40 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             {
                 foreach (var kvp in f.Uniforms)
                     foreach (var u in kvp.Value.Keys)
-                        keys.Add(kvp.Key + "\0" + u);
+                        AddKey(kvp.Key + "\0" + u, kvp.Key, u);
             }
             else
             {
                 foreach (var k in f.TickedUniforms)
-                    if (k.Contains('\0')) keys.Add(k);
+                    if (k.Contains('\0')) AddKeySplit(k);
             }
         }
         foreach (var okey in this.configWindow.DynOverrideUniforms.Keys)
-            keys.Add(okey);
+            AddKeySplit(okey);
         // Trigger overlays must also work for uniforms with no base carrier:
         // node-bound sparse frames never carry (by design), so without this
         // their envelope is silently skipped and the effect pops instead of
         // fading (e.g. Drunk_Strength, which Primary never snapshot).
         if (trigOverlay != null)
             foreach (var okey in trigOverlay.Keys)
-                keys.Add(okey);
+                AddKeySplit(okey);
 
-        foreach (var key in keys)
+        // Per-frame scratch: carrier filter reuses one list to avoid a
+        // ToList per key (contents rebuilt, order stays time-sorted).
+        var carrierScratch = new List<DynamicKeyframe>(pool.Count);
+        // One clock for the whole build (crossfade progress identical for
+        // every key instead of drifting by call order).
+        DateTime nowUtcBuild = DateTime.UtcNow;
+        foreach (var (key, file, uname) in keyParts)
         {
-            int sep = key.IndexOf('\0');
-            var file = key.Substring(0, sep);
-            var uname = key.Substring(sep + 1);
-            var carriers = frozen
-                ? new List<DynamicKeyframe>()
-                : pool.Where(f => CarriesUniform(data, f, file, uname, hasPrimary)).OrderBy(f => f.TimeSeconds).ToList();
+            carrierScratch.Clear();
+            if (!frozen)
+            {
+                foreach (var f in pool)
+                    if (CarriesUniform(data, f, file, uname, hasPrimary))
+                        carrierScratch.Add(f);
+            }
+            var carriers = carrierScratch;
             if (carriers.Count == 0)
             {
                 // No base value: drive purely from the trigger envelope.
@@ -3968,7 +4012,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                     // Winner-change crossfade: morph screen -> new owner.
                     if (_xfade.TryGetValue(key, out var xf0))
                     {
-                        float xh0 = (float)(DateTime.UtcNow - xf0.T0).TotalSeconds / TrigXfadeSec;
+                        float xh0 = (float)(nowUtcBuild - xf0.T0).TotalSeconds / TrigXfadeSec;
                         if (xh0 >= 1f) _xfade.Remove(key);
                         else
                             oout = DynLerpValue(
@@ -3985,10 +4029,24 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             // Twins (same TimeSeconds, e.g. chain frame + pooled primary at
             // 0): prefer the first so chain frames win ties and pc/nc agree.
             // (LastOrDefault picked the pooled primary and every morning
-            // lerped Primary->Day instead of Night->Day.)
-            int pcTime = carriers.Where(f => f.TimeSeconds <= eorzeaSeconds).Select(f => f.TimeSeconds).DefaultIfEmpty(carriers[^1].TimeSeconds).Max();
-            var pc = carriers.First(f => f.TimeSeconds == pcTime);
-            var nc = carriers.FirstOrDefault(f => f.TimeSeconds >= eorzeaSeconds) ?? carriers[0];
+            // lerped Primary->Day instead of Night->Day.) Allocation-free
+            // twin of the old Where/Max/First chain (carriers arrive sorted).
+            int pcTime = carriers[carriers.Count - 1].TimeSeconds;
+            bool anyLe = false;
+            foreach (var f in carriers)
+            {
+                int ft = f.TimeSeconds;
+                if (ft <= eorzeaSeconds && (!anyLe || ft > pcTime)) { pcTime = ft; anyLe = true; }
+            }
+            if (!anyLe) pcTime = carriers[carriers.Count - 1].TimeSeconds;
+            DynamicKeyframe pc = carriers[0], nc = carriers[0];
+            bool pcSet = false, ncSet = false;
+            foreach (var f in carriers)
+            {
+                if (!pcSet && f.TimeSeconds == pcTime) { pc = f; pcSet = true; }
+                if (!ncSet && f.TimeSeconds >= eorzeaSeconds) { nc = f; ncSet = true; }
+                if (pcSet && ncSet) break;
+            }
             var a = StoredUniform(pc, file, uname);
             var b = StoredUniform(nc, file, uname);
             if (a == null || b == null) continue;
@@ -4028,15 +4086,22 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                     }
                 }
             }
-            bool overridden = this.configWindow.DynOverrideUniforms.TryGetValue(file + "\0" + uname, out var ov);
+            bool overridden = this.configWindow.DynOverrideUniforms.TryGetValue(key, out var ov);
             if (overridden)
                 a = b = new DynamicUniformValue { Value = ov.Value, BaseType = ov.BaseType };
             string proto = DynProtoType(string.IsNullOrEmpty(a.BaseType) ? b.BaseType : a.BaseType);
             string outVal = DynLerpValue(a, b, t);
-            if (carriers.Any(f => primary == null || f.Id != primary.Id)
+            bool anyNonPrimary = primary == null;
+            if (primary != null)
+                foreach (var f in carriers)
+                    if (f.Id != primary.Id) { anyNonPrimary = true; break; }
+            if (anyNonPrimary
                 || overridden || (trigOverlay != null && trigOverlay.ContainsKey(key)))
                 liveKeys.Add(key);
-            bool keyBaseOnly = primary != null && carriers.All(f => f.Id == primary.Id);
+            bool keyBaseOnly = primary != null;
+            if (primary != null)
+                foreach (var f in carriers)
+                    if (f.Id != primary.Id) { keyBaseOnly = false; break; }
             if (trigOverlay != null && trigOverlay.ContainsKey(key)) keyBaseOnly = false;
             _curBaseFlags[key] = keyBaseOnly;
             // Time fade: ramp from last-driven values instead of snapping
@@ -4108,7 +4173,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 // Winner-change crossfade: morph screen -> new owner.
                 if (_xfade.TryGetValue(key, out var xf))
                 {
-                    float xh = (float)(DateTime.UtcNow - xf.T0).TotalSeconds / TrigXfadeSec;
+                    float xh = (float)(nowUtcBuild - xf.T0).TotalSeconds / TrigXfadeSec;
                     if (xh >= 1f) _xfade.Remove(key);
                     else
                     {
@@ -4179,7 +4244,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         var pool = new List<DynamicKeyframe>(frames);
         if (primary != null && !pool.Any(f => f.Id == primary.Id)) pool.Add(primary);
         bool hasPrimary = primary != null;
-        var ordered = pool.OrderBy(f => f.TimeSeconds).ToList();
+        pool.Sort(ByKeyframeTime);
+        var ordered = pool;
         var techKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var f in pool)
         {
@@ -4237,14 +4303,21 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 }
                 // Same twin rule as uniforms: latest applicable time, first
                 // carrier there, so chain frames beat the pooled primary.
+                // Single allocation-free pass (ordered arrives sorted).
                 int ct = -1;
                 DynamicKeyframe? tcarrier = null;
+                DynamicKeyframe? lastCarrying = null;
                 foreach (var f in ordered)
-                    if (f.TimeSeconds <= eorzeaSeconds && CarriesTech(data, f, tk, hasPrimary) && f.TimeSeconds > ct)
+                {
+                    if (!CarriesTech(data, f, tk, hasPrimary)) continue;
+                    lastCarrying = f;
+                    if (f.TimeSeconds <= eorzeaSeconds && f.TimeSeconds > ct)
+                    {
                         ct = f.TimeSeconds;
-                tcarrier = ct < 0
-                    ? ordered.LastOrDefault(f => CarriesTech(data, f, tk, hasPrimary))
-                    : ordered.First(f => f.TimeSeconds == ct && CarriesTech(data, f, tk, hasPrimary));
+                        tcarrier = f;
+                    }
+                }
+                if (tcarrier == null) tcarrier = lastCarrying;
                 if (tcarrier != null && tcarrier.TechStates.TryGetValue(tk, out bool st))
                 {
                     effective[tk] = st;
