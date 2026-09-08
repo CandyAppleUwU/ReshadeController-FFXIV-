@@ -1289,12 +1289,13 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         string dynamic;
         Dictionary<string, string> mirroredUniforms;
         Dictionary<string, bool>? mirroredToggles = null;
+        bool writeHandled = false;
         if (dynData != null && !IsPaused && tlSec.HasValue)
         {
-            string liveContent = BuildDynamicAnimContent(dynData, eorzeaSeconds, out var liveMir, trigU);
+            string liveContent = BuildDynamicAnimContent(dynData, eorzeaSeconds, out var liveMir, trigU, false);
             var liveFlags = new Dictionary<string, bool>(_curBaseFlags, StringComparer.OrdinalIgnoreCase);
             Dictionary<string, bool>? liveTg = FlushDynamicToggles(dynData, eorzeaSeconds, trigT, false);
-            string lockContent = BuildDynamicAnimContent(dynData, tlSec.Value, out var lockMir, trigU);
+            string lockContent = BuildDynamicAnimContent(dynData, tlSec.Value, out var lockMir, trigU, false);
             foreach (var kvp in _curBaseFlags.ToList())
                 _curBaseFlags[kvp.Key] = kvp.Value && liveFlags.TryGetValue(kvp.Key, out bool lf) && lf;
             Dictionary<string, bool>? lockTg = FlushDynamicToggles(dynData, tlSec.Value, trigT, false);
@@ -1310,9 +1311,40 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             if (other != null) foreach (var kvp in other) if (!mergedTg.ContainsKey(kvp.Key)) mergedTg[kvp.Key] = kvp.Value;
             mirroredToggles = mergedTg;
             WriteToggleDiffs(mergedTg);
+            // Lock path always full-writes while engaged (transient by
+            // nature): sync emit trackers to the merged state so the later
+            // single-path deltas continue seamlessly.
+            if ((DateTime.UtcNow - _lastAnimWrite).TotalMilliseconds >= 25)
+            {
+                _lastAnimWrite = DateTime.UtcNow;
+                _lastEmitPreset = (dynData != null) ? (this.configWindow.SelectedPreset ?? "") : "";
+                _lastEmitEnabled = dynData != null && dynData.Enabled;
+                _writesSinceFull = 0;
+                _lastWritten.Clear();
+                foreach (var kvp in mirroredUniforms) _lastWritten[kvp.Key] = kvp.Value;
+                _lastLegacyWritten = legacy;
+                _lastWasEmpty = false;
+                try
+                {
+                    var animFile = GetAnimationSignalPath();
+                    if (merged.Content.Length == 0)
+                    {
+                        if (File.Exists(animFile)) File.Delete(animFile);
+                        _lastWasEmpty = true;
+                    }
+                    else
+                    {
+                        var tmp = animFile + ".tmp";
+                        File.WriteAllText(tmp, legacy + merged.Content);
+                        File.Move(tmp, animFile, true);
+                    }
+                }
+                catch { }
+            }
             if (pfSw != null) { _pfContent = 0; _pfToggles = pfSw.ElapsedTicks; pfSw.Restart(); }
             _pfKeys = mirroredUniforms.Count;
             _pfTechs = mirroredToggles?.Count ?? 0;
+            writeHandled = true;
         }
         else
         {
@@ -1347,35 +1379,73 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         }
         catch { }
         if (pfSw != null) { _pfMirror = pfSw.ElapsedTicks; pfSw.Restart(); }
-        var combined = legacy + dynamic;
-        if (IsPaused) return; // hold outputs (see above): touch neither the file nor the change gate
-        if (combined == _lastAnimContent) return; // don't rewrite (and tear) an identical file every frame
-        // Render-thread relief: values move every frame while time runs, so
-        // the change gate alone never holds. Cap file writes at ~40Hz; the
-        // gate still compares against the last WRITTEN content so nothing
-        // ever goes stale (throttled frames return WITHOUT updating it).
-        if ((DateTime.UtcNow - _lastAnimWrite).TotalMilliseconds < 25) return;
-        _lastAnimContent = combined;
-        _lastAnimWrite = DateTime.UtcNow;
-        try
+        // Manual pause holds outputs: touch neither files nor emit
+        // trackers (the sim above keeps ticking for a live resume).
+        if (!writeHandled && !IsPaused)
         {
-            var animFile = GetAnimationSignalPath();
-            if (string.IsNullOrEmpty(combined))
+            string curPreset = (dynData != null) ? (this.configWindow.SelectedPreset ?? "") : "";
+            bool curEnabled = dynData != null && dynData.Enabled;
+            bool legChanged = !string.Equals(legacy, _lastLegacyWritten, StringComparison.Ordinal);
+            if (dynamic.Length == 0 && legacy.Length == 0)
             {
-                if (File.Exists(animFile)) File.Delete(animFile);
+                // Empty: delete once (coalesced like the old gate), reset
+                // emit trackers so the next content full-emits naturally.
+                if (!_lastWasEmpty)
+                {
+                    try { var af0 = GetAnimationSignalPath(); if (File.Exists(af0)) File.Delete(af0); } catch { }
+                    _lastWasEmpty = true;
+                }
+                _lastWritten.Clear();
+                _lastLegacyWritten = "\0";
+                _writesSinceFull = 0;
+                _lastEmitPreset = "";
+                _lastEmitEnabled = false;
             }
             else
             {
-                var tmp = animFile + ".tmp";
-                File.WriteAllText(tmp, combined);
-                File.Move(tmp, animFile, true);
+                if ((DateTime.UtcNow - _lastAnimWrite).TotalMilliseconds < 25) return;
+                _lastWasEmpty = false;
+                string toWrite = (_emitFull || legChanged) ? legacy + dynamic : dynamic;
+                if (toWrite.Length == 0)
+                {
+                    // Forced but empty (fresh enable on empty content):
+                    // ensure absence like the empty branch.
+                    try { var af1 = GetAnimationSignalPath(); if (File.Exists(af1)) File.Delete(af1); } catch { }
+                    _lastWasEmpty = true;
+                }
+                else
+                {
+                    try
+                    {
+                        var animFile = GetAnimationSignalPath();
+                        var tmp = animFile + ".tmp";
+                        File.WriteAllText(tmp, toWrite);
+                        File.Move(tmp, animFile, true);
+                    }
+                    catch { }
+                    _lastWasEmpty = false;
+                }
+                _lastAnimWrite = DateTime.UtcNow;
+                _lastEmitPreset = curPreset;
+                _lastEmitEnabled = curEnabled;
+                if (_emitFull)
+                {
+                    _writesSinceFull = 0;
+                    _lastWritten.Clear();
+                    foreach (var kvp in mirroredUniforms) _lastWritten[kvp.Key] = kvp.Value;
+                }
+                else
+                {
+                    _writesSinceFull++;
+                    foreach (var k in _emitChanged)
+                        if (mirroredUniforms.TryGetValue(k, out var vv)) _lastWritten[k] = vv;
+                }
+                _lastLegacyWritten = legacy;
             }
         }
-        catch { }
         if (pfSw != null) _pfWrite = pfSw.ElapsedTicks;
     }
 
-    private string _lastAnimContent = "\0";
     private DateTime _lastAnimWrite = DateTime.MinValue;
     // Perf readout (/reshade perf): last-frame section costs in Stopwatch
     // ticks + output sizes. Zero when idle (no dynamic preset).
@@ -3921,9 +3991,40 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         return (sb.ToString(), mir);
     }
 
-    private string BuildDynamicAnimContent(DynamicPresetData? data, int eorzeaSeconds, out Dictionary<string, string> mirrored, Dictionary<string, (DynamicUniformValue? From, DynamicUniformValue To, float F)>? trigOverlay = null)
+    // Delta gate for one formatted line (single path only): true = format
+    // now (changed, or forced full); records the key for post-write sync.
+    // Unchanged keys stay out of the file — the addon sticky-holds them.
+    private bool EmitChangedLine(string key, string value)
+    {
+        if (_lastWritten.TryGetValue(key, out var pv) && pv == value) return false;
+        _emitChanged.Add(key);
+        return true;
+    }
+    private readonly Dictionary<string, string> _lastWritten = new(StringComparer.OrdinalIgnoreCase);
+    private string _lastLegacyWritten = "\0";
+    private string _lastEmitPreset = "";
+    private bool _lastEmitEnabled;
+    private int _writesSinceFull;
+    private bool _lastWasEmpty = true;
+    // Per-build scratch (single path only): keys formatted this build, and
+    // whether it emitted full. Cleared at build start; the timelock double
+    // build doesn't use them (it always full-writes while engaged).
+    private readonly List<string> _emitChanged = new();
+    private bool _emitFull;
+
+    private string BuildDynamicAnimContent(DynamicPresetData? data, int eorzeaSeconds, out Dictionary<string, string> mirrored, Dictionary<string, (DynamicUniformValue? From, DynamicUniformValue To, float F)>? trigOverlay = null, bool deltaOk = true)
     {
         mirrored = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        _emitChanged.Clear();
+        _emitFull = false;
+        // Delta/full decision up front (single path only; the timelock
+        // double build formats full and ignores all of this).
+        string emitPreset = (data != null) ? (this.configWindow.SelectedPreset ?? "") : "";
+        bool emitEnabled = data != null && data.Enabled;
+        bool forceFullFrame = deltaOk && (!string.Equals(emitPreset, _lastEmitPreset, StringComparison.OrdinalIgnoreCase)
+            || emitEnabled != _lastEmitEnabled
+            || _writesSinceFull >= 80);
+        if (deltaOk) _emitFull = forceFullFrame;
         var frames = DynamicTimeline.EvalFrames(data, n => TimeNodeOn(data, n.Id));
         if (frames == null || frames.Count == 0) return "";
         // A chain exists but gating cut it entirely: freeze the timeline
@@ -4081,7 +4182,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                                 new DynamicUniformValue { Value = xf0.Value, BaseType = oo.To.BaseType },
                                 new DynamicUniformValue { Value = oout, BaseType = oo.To.BaseType }, Smooth01(xh0));
                     }
-                    sb.AppendLine($"{file}|{uname}|{oproto}|{oout}");
+                    if (!deltaOk || forceFullFrame || EmitChangedLine(key, oout))
+                        sb.AppendLine($"{file}|{uname}|{oproto}|{oout}");
                     mirrored[key] = oout;
                     _curBaseFlags[key] = false;
                     liveKeys.Add(key);
@@ -4246,7 +4348,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                     }
                 }
             }
-            sb.AppendLine($"{file}|{uname}|{proto}|{outVal}");
+            if (!deltaOk || forceFullFrame || EmitChangedLine(key, outVal))
+                sb.AppendLine($"{file}|{uname}|{proto}|{outVal}");
             mirrored[key] = outVal;
         }
         // Fade-out layer: dying chains hold orphaned keys, ramping toward
@@ -4285,7 +4388,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                     var oFromUv = new DynamicUniformValue { Value = ostart, BaseType = otBase };
                     var oToUv = new DynamicUniformValue { Value = otarget, BaseType = otBase };
                     string oVal = DynLerpValue(oFromUv, oToUv, Math.Clamp(of, 0f, 1f));
-                    sb.AppendLine($"{ofile}|{ouname}|{DynProtoType(otBase)}|{oVal}");
+                    if (!deltaOk || forceFullFrame || EmitChangedLine(key, oVal))
+                        sb.AppendLine($"{ofile}|{ouname}|{DynProtoType(otBase)}|{oVal}");
                     mirrored[key] = oVal;
                 }
             }
