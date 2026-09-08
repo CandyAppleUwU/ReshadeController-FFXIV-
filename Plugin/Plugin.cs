@@ -3737,21 +3737,62 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     // A frame carries a setting if it's full (primary or legacy) and stores
     // it, or sparse and ticks it. No primary anywhere = legacy mode: every
     // frame carries everything it stores.
-    private static bool CarriesUniform(DynamicPresetData? data, DynamicKeyframe f, string file, string uname, bool hasPrimary)
+    // Per-build carrier sets: which keys each pool frame carries. Full
+    // frames map to null (carries everything stored — checked inline, no
+    // precompute garbage for base content); sparse frames map to their
+    // ticked keys present in storage (node-bound maps to the shared empty
+    // set). Depends only on data shape, not time: one build pass replaces
+    // thousands of per-key closure/concat/node-scan calls.
+    private static readonly HashSet<string> NoCarryKeys =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static void BuildCarrySets(DynamicPresetData? data, List<DynamicKeyframe> pool,
+        bool hasPrimary, out Dictionary<DynamicKeyframe, HashSet<string>?> carryU,
+        out Dictionary<DynamicKeyframe, HashSet<string>?> carryT)
     {
-        if (StoredUniform(f, file, uname) == null) return false;
-        if (!hasPrimary || f.IsPrimary || !f.Sparse) return true;
-        if (IsNodeBound(data, f.Id)) return false;
-        return f.TickedUniforms.Any(k => string.Equals(k, file + "\0" + uname, StringComparison.OrdinalIgnoreCase));
+        carryU = new Dictionary<DynamicKeyframe, HashSet<string>?>(pool.Count);
+        carryT = new Dictionary<DynamicKeyframe, HashSet<string>?>(pool.Count);
+        foreach (var f in pool)
+        {
+            bool fullF = !hasPrimary || f.IsPrimary || !f.Sparse;
+            if (fullF) { carryU[f] = null; carryT[f] = null; continue; }
+            if (IsNodeBound(data, f.Id)) { carryU[f] = NoCarryKeys; carryT[f] = NoCarryKeys; continue; }
+            HashSet<string>? su = null, st = null;
+            foreach (var k in f.TickedUniforms)
+            {
+                int s2 = k.IndexOf('\0');
+                if (s2 < 0) continue;
+                if (f.Uniforms.TryGetValue(k.Substring(0, s2), out var m) && m.ContainsKey(k.Substring(s2 + 1)))
+                    (su ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(k);
+            }
+            foreach (var k in f.TickedTechs)
+                if (f.TechStates.ContainsKey(k))
+                    (st ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(k);
+            carryU[f] = su ?? NoCarryKeys;
+            carryT[f] = st ?? NoCarryKeys;
+        }
     }
 
-    private static bool CarriesTech(DynamicPresetData? data, DynamicKeyframe f, string techKey, bool hasPrimary)
+    private static bool CarriesU(Dictionary<DynamicKeyframe, HashSet<string>?> sets,
+        DynamicKeyframe f, string key, string file, string uname)
     {
-        if (!f.TechStates.ContainsKey(techKey)) return false;
-        if (!hasPrimary || f.IsPrimary || !f.Sparse) return true;
-        if (IsNodeBound(data, f.Id)) return false;
-        return f.TickedTechs.Any(k => string.Equals(k, techKey, StringComparison.OrdinalIgnoreCase));
+        if (!sets.TryGetValue(f, out var set)) return false;
+        if (set == null) return StoredUniform(f, file, uname) != null;
+        return set.Contains(key);
     }
+
+    private static bool CarriesT(Dictionary<DynamicKeyframe, HashSet<string>?> sets,
+        DynamicKeyframe f, string techKey)
+    {
+        if (!sets.TryGetValue(f, out var set)) return false;
+        if (set == null) return f.TechStates.ContainsKey(techKey);
+        return set.Contains(techKey);
+    }
+
+    // (Superseded by BuildCarrySets + CarriesU/CarriesT above: same rule,
+    // evaluated once per build instead of per key. Kept documented here:
+    // full frames carry everything stored; sparse frames carry ticked keys
+    // present in storage unless node-bound.)
 
     // Time Lock arbitration: newest activation among wired + satisfied
     // locks wins (ties -> list order). Returns the locked Eorzea seconds
@@ -3879,6 +3920,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         // Time order once per build: carriers below stay sorted without a
         // per-key OrderBy (identical order to the old filter+sort).
         pool.Sort(ByKeyframeTime);
+        // Carrier membership once per build (see BuildCarrySets): the loops
+        // below become set lookups instead of per-key scans.
+        BuildCarrySets(data, pool, hasPrimary, out var carryU, out var carryT);
         var fadeByFrame = TimeFadeFactors(data);
         // Chain-start transfer function for segment blending (CurveMode on
         // the walk head; 24H Brightness Curve needs sidecar data). Hoisted:
@@ -3965,7 +4009,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             if (!frozen)
             {
                 foreach (var f in pool)
-                    if (CarriesUniform(data, f, file, uname, hasPrimary))
+                    if (CarriesU(carryU, f, key, file, uname))
                         carrierScratch.Add(f);
             }
             var carriers = carrierScratch;
@@ -4065,7 +4109,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             {
                 var cf0 = frames[0];
                 var cf1 = frames[1];
-                if (CarriesUniform(data, cf0, file, uname, hasPrimary) && CarriesUniform(data, cf1, file, uname, hasPrimary))
+                if (CarriesU(carryU, cf0, key, file, uname) && CarriesU(carryU, cf1, key, file, uname))
                 {
                     var e0 = StoredUniform(cf0, file, uname);
                     var e1 = StoredUniform(cf1, file, uname);
@@ -4246,6 +4290,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         bool hasPrimary = primary != null;
         pool.Sort(ByKeyframeTime);
         var ordered = pool;
+        BuildCarrySets(data, pool, hasPrimary, out var carryUT, out var carryTT);
         var techKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var f in pool)
         {
@@ -4292,7 +4337,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 {
                     var pf0 = frames[0];
                     var pf1 = frames[1];
-                    if (CarriesTech(data, pf0, tk, hasPrimary) && CarriesTech(data, pf1, tk, hasPrimary)
+                    if (CarriesT(carryTT, pf0, tk) && CarriesT(carryTT, pf1, tk)
                         && pf0.TechStates.TryGetValue(tk, out bool se) && pf1.TechStates.TryGetValue(tk, out bool sl))
                     {
                         bool earlyIsNight = pf0.TimeSeconds <= pf1.TimeSeconds;
@@ -4309,7 +4354,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 DynamicKeyframe? lastCarrying = null;
                 foreach (var f in ordered)
                 {
-                    if (!CarriesTech(data, f, tk, hasPrimary)) continue;
+                    if (!CarriesT(carryTT, f, tk)) continue;
                     lastCarrying = f;
                     if (f.TimeSeconds <= eorzeaSeconds && f.TimeSeconds > ct)
                     {
