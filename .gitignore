@@ -25,6 +25,9 @@ __pycache__/
 # Release zips (uploaded to GitHub Releases, not stored in git)
 dist/
 
+# Local agent/dev notes (never public)
+agent_*.md
+
 # OS noise
 Thumbs.db
 Desktop.ini
