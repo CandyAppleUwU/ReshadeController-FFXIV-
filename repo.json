@@ -5,7 +5,7 @@
     "Description": "Dynamic ReShade presets that react to what's happening in game — time of day, weather, location and more — through a visual node Animator, plus per-zone, cutscene and duty presets. Requires ReShade with the reshade_controller addon in the game folder.",
     "Punchline": "Controls ReShade shaders based on what's going on in game",
     "InternalName": "ReshadeController",
-    "AssemblyVersion": "0.9.316.0",
+    "AssemblyVersion": "0.9.317.0",
     "RepoUrl": "https://github.com/CandyAppleUwU/ReshadeController-FFXIV-",
     "ApplicableVersion": "any",
     "Tags": [
@@ -18,9 +18,9 @@
     "DalamudApiLevel": 15,
     "IsHide": "False",
     "IsTestingExclusive": "False",
-    "LastUpdated": 1788902877,
-    "DownloadLinkInstall": "https://github.com/CandyAppleUwU/ReshadeController-FFXIV-/releases/download/v0.9.316/ReshadeController.zip",
-    "DownloadLinkTesting": "https://github.com/CandyAppleUwU/ReshadeController-FFXIV-/releases/download/v0.9.316/ReshadeController.zip",
-    "DownloadLinkUpdate": "https://github.com/CandyAppleUwU/ReshadeController-FFXIV-/releases/download/v0.9.316/ReshadeController.zip"
+    "LastUpdated": 1788906491,
+    "DownloadLinkInstall": "https://github.com/CandyAppleUwU/ReshadeController-FFXIV-/releases/download/v0.9.317/ReshadeController.zip",
+    "DownloadLinkTesting": "https://github.com/CandyAppleUwU/ReshadeController-FFXIV-/releases/download/v0.9.317/ReshadeController.zip",
+    "DownloadLinkUpdate": "https://github.com/CandyAppleUwU/ReshadeController-FFXIV-/releases/download/v0.9.317/ReshadeController.zip"
   }
 ]

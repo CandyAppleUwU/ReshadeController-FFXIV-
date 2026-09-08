@@ -1264,12 +1264,17 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             _timeFadeOutStart.Clear();
             _fadeOutFrom.Clear();
         }
+        // Perf readout (/reshade perf): per-section last-frame cost of the
+        // dynamic engine. Stopwatch only runs with a dynamic preset active.
+        System.Diagnostics.Stopwatch? pfSw = dynData != null ? System.Diagnostics.Stopwatch.StartNew() : null;
+        if (pfSw == null) { _pfOverlays = _pfContent = _pfToggles = _pfMirror = _pfWrite = 0; _pfKeys = _pfTechs = 0; }
         BuildTriggerOverlay(dynData, DateTime.UtcNow, out var trigU, out var trigT, out var envU, out var envT);
         BuildWallOverlay(dynData, trigU, trigT, envU, envT);
         BuildBandOverlay(dynData, trigU, trigT, envU, envT);
         BuildTimerOverlay(dynData, DateTime.UtcNow);
         BuildPresetOverlay(dynData);
         string legacy = BuildLegacyAnimContent(eorzeaSeconds);
+        if (pfSw != null) { _pfOverlays = pfSw.ElapsedTicks; pfSw.Restart(); }
         float tlDt = 0f;
         try { tlDt = (float)_.UpdateDelta.TotalSeconds; } catch { }
         if (tlDt < 0f || tlDt > 0.5f) tlDt = Math.Min(Math.Max(tlDt, 0f), 0.5f);
@@ -1305,12 +1310,19 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             if (other != null) foreach (var kvp in other) if (!mergedTg.ContainsKey(kvp.Key)) mergedTg[kvp.Key] = kvp.Value;
             mirroredToggles = mergedTg;
             WriteToggleDiffs(mergedTg);
+            if (pfSw != null) { _pfContent = 0; _pfToggles = pfSw.ElapsedTicks; pfSw.Restart(); }
+            _pfKeys = mirroredUniforms.Count;
+            _pfTechs = mirroredToggles?.Count ?? 0;
         }
         else
         {
             dynamic = BuildDynamicAnimContent(dynData, eorzeaSeconds, out mirroredUniforms, trigU);
+            if (pfSw != null) { _pfContent = pfSw.ElapsedTicks; pfSw.Restart(); }
             if (dynData != null)
                 mirroredToggles = FlushDynamicToggles(dynData, eorzeaSeconds, trigT);
+            if (pfSw != null) { _pfToggles = pfSw.ElapsedTicks; pfSw.Restart(); }
+            _pfKeys = mirroredUniforms.Count;
+            _pfTechs = mirroredToggles?.Count ?? 0;
         }
         // Paused shaders hold outputs (panels + signal files) while the sim
         // keeps ticking underneath, so resume picks up the current state
@@ -1334,6 +1346,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 _prevToggles = mirroredToggles;
         }
         catch { }
+        if (pfSw != null) { _pfMirror = pfSw.ElapsedTicks; pfSw.Restart(); }
         var combined = legacy + dynamic;
         if (IsPaused) return; // hold outputs (see above): touch neither the file nor the change gate
         if (combined == _lastAnimContent) return; // don't rewrite (and tear) an identical file every frame
@@ -1359,10 +1372,15 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             }
         }
         catch { }
+        if (pfSw != null) _pfWrite = pfSw.ElapsedTicks;
     }
 
     private string _lastAnimContent = "\0";
     private DateTime _lastAnimWrite = DateTime.MinValue;
+    // Perf readout (/reshade perf): last-frame section costs in Stopwatch
+    // ticks + output sizes. Zero when idle (no dynamic preset).
+    private long _pfOverlays, _pfContent, _pfToggles, _pfMirror, _pfWrite;
+    private int _pfKeys, _pfTechs;
 
     private string BuildLegacyAnimContent(int eorzeaSeconds)
     {
@@ -4723,6 +4741,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 this.chatGui.Print("  /reshade resume - Resume shaders");
                 this.chatGui.Print("  /reshade toggle - Toggle shaders");
                 this.chatGui.Print("  /reshade status - Show status");
+                this.chatGui.Print("  /reshade perf - Show engine cost");
                 this.chatGui.Print("  /reshade preset <path> - Swap preset");
                 break;
 
@@ -4763,6 +4782,17 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 var paused = File.Exists(pauseFile);
                 this.chatGui.Print($"[Reshade] Shaders: {(paused ? "PAUSED" : "Running")}");
                 this.chatGui.Print($"[Reshade] Current zone: {CurrentTerritoryName} ({CurrentTerritoryId})");
+                break;
+
+            case "perf":
+                try
+                {
+                    double f = 1000000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    double ov = _pfOverlays * f, co = _pfContent * f, tg = _pfToggles * f,
+                        mi = _pfMirror * f, wr = _pfWrite * f;
+                    this.chatGui.Print($"[Reshade] perf µs last frame: overlays {ov:F0} | content {co:F0} | toggles {tg:F0} | mirror {mi:F0} | write {wr:F0} | total {ov + co + tg + mi + wr:F0} ({_pfKeys} keys, {_pfTechs} techs)");
+                }
+                catch { }
                 break;
 
             case "preset":
