@@ -3189,47 +3189,47 @@ public class ConfigWindow : Window, IDisposable
                         ImGui.SetTooltip("already exists with that name");
                 }
             }
-            // Trim primary to driven keys (see TrimPrimaryToDriven): drops
-            // everything no keyframe drives from the base snapshot, with a
-            // backup. Only for dynamic presets with a loaded sidecar.
-            bool canTrim = alreadyDynamic && activeDynData != null;
-            if (!canTrim) ImGui.BeginDisabled();
-            ImGui.SameLine();
-            if (ImGui.Button("Trim Primary"))
+        }
+        // Trim primary to driven keys (see TrimPrimaryToDriven): drops
+        // everything no keyframe drives from the base snapshot, with a
+        // backup. Only for dynamic presets with a loaded sidecar.
+        bool canTrim = alreadyDynamic && activeDynData != null;
+        if (!canTrim) ImGui.BeginDisabled();
+        ImGui.SameLine();
+        if (ImGui.Button("Trim Primary"))
+        {
+            try
             {
-                try
+                EnsureDynCache();
+                if (activeDynData == null || !string.Equals(activeDynPath, selectedPresetPath, StringComparison.OrdinalIgnoreCase))
                 {
-                    EnsureDynCache();
-                    if (activeDynData == null || !string.Equals(activeDynPath, selectedPresetPath, StringComparison.OrdinalIgnoreCase))
-                    {
-                        trimStatus = "Sidecar not loaded for this preset — reselect it first.";
-                    }
-                    else
-                    {
-                        if (!string.IsNullOrEmpty(selectedPresetPath))
-                        {
-                            var sc = DynamicPresetStore.SidecarPath(selectedPresetPath);
-                            if (File.Exists(sc)) File.Copy(sc, sc + ".trimbak", true);
-                        }
-                        var (dt2, du2) = TrimPrimaryToDriven();
-                        trimStatus = $"Trimmed {dt2} toggles, {du2} uniforms from primary (backup .trimbak).";
-                    }
+                    trimStatus = "Sidecar not loaded for this preset — reselect it first.";
                 }
-                catch (Exception ex) { try { trimStatus = "Trim failed: " + ex.Message; } catch { } }
+                else
+                {
+                    if (!string.IsNullOrEmpty(selectedPresetPath))
+                    {
+                        var sc = DynamicPresetStore.SidecarPath(selectedPresetPath);
+                        if (File.Exists(sc)) File.Copy(sc, sc + ".trimbak", true);
+                    }
+                    var (dt2, du2) = TrimPrimaryToDriven();
+                    trimStatus = $"Trimmed {dt2} toggles, {du2} uniforms from primary (backup .trimbak).";
+                }
             }
-            if (!canTrim)
-            {
-                ImGui.EndDisabled();
-                if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-                    ImGui.SetTooltip("select a dynamic preset first");
-            }
-            else if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Drop undriven keys from the primary snapshot (backup first). Ticking later re-adopts.");
-            if (!string.IsNullOrEmpty(trimStatus))
-            {
-                ImGui.SameLine();
-                ImGui.TextDisabled(trimStatus);
-            }
+            catch (Exception ex) { try { trimStatus = "Trim failed: " + ex.Message; } catch { } }
+        }
+        if (!canTrim)
+        {
+            ImGui.EndDisabled();
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip("select a dynamic preset first");
+        }
+        else if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Drop undriven keys from the primary snapshot (backup first). Ticking later re-adopts.");
+        if (!string.IsNullOrEmpty(trimStatus))
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled(trimStatus);
         }
         DrawPresetNameModal();
         DrawDynamicSection();
