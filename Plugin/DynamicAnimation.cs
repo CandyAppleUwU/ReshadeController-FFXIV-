@@ -304,9 +304,11 @@ public class DynamicAnimNode
     public float TimeLockFadeOut { get; set; } = 1f;
     // Location Switch nodes (Source == "spot"): a plain zone-ID list.
     // ON while standing in any listed zone, OFF elsewhere; SpotInvert
-    // flips both. Sensor only, never bound.
+    // flips both. SpotDuty counts BoundByDuty (all duties) as inside.
+    // Sensor only, never bound.
     public List<uint> SpotZones { get; set; } = new();
     public bool SpotInvert { get; set; }
+    public bool SpotDuty { get; set; }
     // Time gate nodes (Source == "timegate"): ON window in Eorzea seconds.
     // Equal values = always on. Overnight ranges wrap past midnight.
     public int TimeGateOn { get; set; }

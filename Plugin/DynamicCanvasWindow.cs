@@ -1340,6 +1340,15 @@ public class DynamicCanvasWindow : Window, IDisposable
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Reversed: ON outside every listed zone, OFF inside.");
+        ImGui.SameLine(0, 8);
+        bool duty = node.SpotDuty;
+        if (ImGui.Checkbox("Duty##anspotd_" + node.Id, ref duty))
+        {
+            node.SpotDuty = duty;
+            config.SaveActiveDyn();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Count BoundByDuty (all duties) as inside.");
     }
 
     // Location Switch zone rows: one per listed zone (never fewer than

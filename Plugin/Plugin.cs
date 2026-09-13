@@ -892,15 +892,19 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         catch { return data?.Daylight; }
     }
 
-    // Location Switch sensor: ON while standing in any listed zone, OFF
-    // elsewhere; SpotInvert flips it (ON outside, OFF inside). Pure level,
-    // no latch. Public for the canvas stamp.
+    // Location Switch sensor: ON while standing in any listed zone (or
+    // bound by duty with SpotDuty), OFF elsewhere; SpotInvert flips it
+    // (ON outside, OFF inside). Pure level, no latch. Public for the stamp.
     public bool SpotLive(DynamicAnimNode n)
     {
         try
         {
             uint terr = CurrentTerritoryId;
             bool inside = terr != 0 && n.SpotZones != null && n.SpotZones.Contains(terr);
+            if (!inside && n.SpotDuty)
+            {
+                try { if (condition[ConditionFlag.BoundByDuty]) inside = true; } catch { }
+            }
             return n.SpotInvert ? !inside : inside;
         }
         catch { return false; }
