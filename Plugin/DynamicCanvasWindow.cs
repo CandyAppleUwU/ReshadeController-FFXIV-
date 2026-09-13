@@ -330,7 +330,7 @@ public class DynamicCanvasWindow : Window, IDisposable
     }
 
     // Baked per stage (bump the trailing number on every build): proves which code is running.
-    internal const string BuildTag = "Beta 0.9.319";
+    internal const string BuildTag = "Beta 0.9.320";
 
     public DynamicCanvasWindow(Plugin plugin, ConfigWindow config)
         : base("ReShade Animator")
