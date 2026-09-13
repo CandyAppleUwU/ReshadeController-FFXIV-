@@ -4232,7 +4232,12 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             // night look on the earlier keyframe. Longer chains and
             // primary-shared keys keep per-segment pacing.
             bool isPair = segCurve == 2 && frames.Count == 2 && carriers.Count == 2;
-            float t = DynamicTimeline.SegmentFactor(pc.TimeSeconds, nc.TimeSeconds, eorzeaSeconds, segCurve, segDaylight, isPair, segDlCache);
+            // Hold: freeze at pc's values until its HoldUntilSec, then blend.
+            // Pair chains blend globally and ignore holds (see SegmentFactor).
+            int holdLen = 0;
+            if (!isPair && pc.HoldUntilSec > 0)
+                holdLen = (pc.HoldUntilSec - pc.TimeSeconds + 86400) % 86400;
+            float t = DynamicTimeline.SegmentFactor(pc.TimeSeconds, nc.TimeSeconds, eorzeaSeconds, segCurve, segDaylight, isPair, segDlCache, holdLen);
             // Pair upgrade: both chain frames define this key, so they own it
             // outright by global brightness position — even when the pooled
             // primary also carries it (it otherwise owns the wrap hours and

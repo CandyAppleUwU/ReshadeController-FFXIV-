@@ -24,6 +24,13 @@ public class DynamicKeyframe
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string Name { get; set; } = "";
     public int TimeSeconds { get; set; }
+    // Hold this keyframe's values until this Eorzea second before blending
+    // toward the next frame (0 = off, blend the whole segment). Lets one
+    // object cover a hold + the next transition (e.g. A@00:00 hold-to-05:00,
+    // B@06:00) instead of duplicating looks to delimit holds. Toggles need
+    // nothing: the twin rule already holds them till the next keyframe.
+    // Pair chains (global brightness blend) ignore holds by design.
+    public int HoldUntilSec { get; set; }
     public Dictionary<string, bool> TechStates { get; set; } = new();
     public Dictionary<string, Dictionary<string, DynamicUniformValue>> Uniforms { get; set; } = new();
     // Sparse keyframes drive only ticked settings; the primary (full base)
@@ -615,12 +622,19 @@ public static class DynamicTimeline
         => SegmentFactor(t0, t1, now, 0, null);
 
     public static float SegmentFactor(int t0, int t1, int now, int curveMode, DynamicDaylight? dl, bool dayNightPair = false,
-        Dictionary<(int t0, int t1), (float mn, float mx)>? dlCache = null)
+        Dictionary<(int t0, int t1), (float mn, float mx)>? dlCache = null, int holdLen = 0)
     {
         int span = (t1 - t0 + 86400) % 86400;
         if (span == 0) return 0;
         int elapsed = (now - t0 + 86400) % 86400;
-        float p = Math.Clamp((float)elapsed / span, 0f, 1f);
+        // Hold remap: freeze at the segment start for holdLen seconds, then
+        // traverse the remainder. Circular-safe (holdLen already wrapped);
+        // clamps cover hold-past-end (holds everything) automatically.
+        float p;
+        if (holdLen < 0) holdLen = 0;
+        if (holdLen >= span) p = 0f;
+        else if (elapsed <= holdLen) p = 0f;
+        else p = Math.Clamp((float)(elapsed - holdLen) / (span - holdLen), 0f, 1f);
         if (curveMode == 1) return p;
         if (curveMode == 2 && dl != null && dl.Values != null && dl.Values.Count > 0)
         {

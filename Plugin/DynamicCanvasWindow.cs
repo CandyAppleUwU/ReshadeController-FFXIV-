@@ -167,6 +167,19 @@ public class DynamicCanvasWindow : Window, IDisposable
         catch { return false; }
     }
 
+    // Hold row: shown on every keyframe-bound time node (chain-start and
+    // chained alike — any keyframe can start a segment). One row in both
+    // states (Off+Set, or inputs+Clr) so the height never depends on it.
+    private bool HoldRowVisible(DynamicPresetData data, DynamicAnimNode node)
+    {
+        try
+        {
+            if (!IsTime(node)) return false;
+            if (BoundKeyframe(data, node) == null) return false;
+            return startEndNode != node.Id;
+        }
+        catch { return false; }
+    }
     // Time-node input exclusivity: a time node is either chained (time
     // inputs) or weather-gated (max one weather pin), never both. Other
     // targets are unrestricted.
@@ -239,7 +252,8 @@ public class DynamicCanvasWindow : Window, IDisposable
         if (IsSpot(node)) return 6f + HeaderH + 8 + 30 * SpotZoneRows(node) + 30 + 30;
         if (!IsTrigger(node) && !IsCoords(node) && !IsWall(node))
             return NodeH + 60 - (HasTimeInput(data, node.Id) ? 60 : 0)
-                + (DayNightRowVisible(data, node) ? 30 : 0);
+                + (DayNightRowVisible(data, node) ? 30 : 0)
+                + (HoldRowVisible(data, node) ? 30 : 0);
         float h = IsWall(node) ? 410f + 30f * WallKeepExtraRows(node)
             : node.TriggerKind == 18
             ? 440f + 30f * ZoneVisExtraRows(node)
@@ -296,6 +310,7 @@ public class DynamicCanvasWindow : Window, IDisposable
     private string? selectedNode;
     private string? dragNode;
     private readonly Dictionary<string, string[]> timeDrafts = new();
+    private readonly Dictionary<string, string[]> holdDrafts = new();
     private Vector2 dragDownPos;
     private Vector2 dragStartPos;
     private bool dragMoved;
@@ -315,7 +330,7 @@ public class DynamicCanvasWindow : Window, IDisposable
     }
 
     // Baked per stage (bump the trailing number on every build): proves which code is running.
-    internal const string BuildTag = "Beta 0.9.318";
+    internal const string BuildTag = "Beta 0.9.319";
 
     public DynamicCanvasWindow(Plugin plugin, ConfigWindow config)
         : base("ReShade Animator")
@@ -3391,6 +3406,72 @@ public class DynamicCanvasWindow : Window, IDisposable
                 boundKf.TimeSeconds = config.GetEorzeaSec();
                 timeDrafts[node.Id] = SplitTime(boundKf.TimeSeconds);
                 config.SaveActiveDyn();
+            }
+        }
+
+        // Hold-until row: freeze this keyframe's values until an Eorzea
+        // time, then blend toward the next frame (0 = off). One row in
+        // both states so NodeHeight never depends on it (see HoldRowVisible).
+        if (HoldRowVisible(data, node) && boundKf != null)
+        {
+            ImGui.SetCursorPosX(node.X + RowPadX);
+            float holdLabelW = ImGui.CalcTextSize("Hold:").X;
+            float colonW2 = ImGui.CalcTextSize(":").X;
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextUnformatted("Hold:");
+            ImGui.SameLine(0, 3);
+            if (boundKf.HoldUntilSec <= 0)
+            {
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextDisabled("Off");
+                ImGui.SameLine(0, 3);
+                if (ImGui.Button("Set##anholdset_" + node.Id))
+                {
+                    boundKf.HoldUntilSec = Math.Clamp(boundKf.TimeSeconds, 0, 86399);
+                    holdDrafts[node.Id] = SplitTime(boundKf.HoldUntilSec);
+                    config.SaveActiveDyn();
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Hold this look until an Eorzea time instead of blending straight to the next keyframe. 0 = off.");
+            }
+            else
+            {
+                if (!holdDrafts.TryGetValue(node.Id, out var hparts))
+                    holdDrafts[node.Id] = hparts = SplitTime(boundKf.HoldUntilSec);
+                float digitW2 = ImGui.CalcTextSize("00").X + ImGui.GetStyle().FramePadding.X * 2 + 6;
+                float clrW = Math.Max(30, nodeW - RowPadX - holdLabelW - 3 * digitW2 - 2 * colonW2 - 22);
+                string[] hpartIds = { "##anholdh_" + node.Id, "##anholdmi_" + node.Id, "##anholds_" + node.Id };
+                int[] hpartMax = { 23, 59, 59 };
+                bool hcommit = false;
+                bool hanyActive = false;
+                for (int p = 0; p < 3; p++)
+                {
+                    if (p > 0)
+                    {
+                        ImGui.SameLine(0, 3);
+                        ImGui.AlignTextToFramePadding();
+                        ImGui.TextUnformatted(":");
+                        ImGui.SameLine(0, 3);
+                    }
+                    hcommit |= TimePart(hpartIds[p], hparts, p, hpartMax[p], digitW2, ref hanyActive);
+                }
+                if (hcommit)
+                {
+                    boundKf.HoldUntilSec = ParseTimeParts(hparts, boundKf.HoldUntilSec);
+                    config.SaveActiveDyn();
+                    holdDrafts[node.Id] = hparts = SplitTime(boundKf.HoldUntilSec);
+                }
+                else if (!hanyActive)
+                    holdDrafts[node.Id] = hparts = SplitTime(boundKf.HoldUntilSec);
+                ImGui.SameLine(0, 3);
+                if (ImGui.Button("Clr", new Vector2(clrW, 0)))
+                {
+                    boundKf.HoldUntilSec = 0;
+                    holdDrafts.Remove(node.Id);
+                    config.SaveActiveDyn();
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Stop holding (blend the whole segment). Hold to 23:59:59 to cover midnight.");
             }
         }
 
