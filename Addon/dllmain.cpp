@@ -147,7 +147,10 @@ static std::string get_exe_dir()
 
 static std::string read_file(const std::string &path)
 {
-	HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+	// Share DELETE+WRITE so the plugin's atomic tmp+MoveFileEx(REPLACE_EXISTING)
+	// (a rename = DELETE on destination) never fails inside our read window.
+	HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hFile == INVALID_HANDLE_VALUE) return "";
 

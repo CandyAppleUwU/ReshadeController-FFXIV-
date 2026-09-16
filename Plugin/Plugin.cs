@@ -235,7 +235,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 File.Move(tmp, clockPath, true);
                 NoteSignalOk();
             }
-            catch { NoteSignalFail(); }
+            catch (Exception ex) { NoteSignalFail(ex, clockPath); }
         }
         catch { }
     }
@@ -847,17 +847,17 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             pendingPresetPath = null;
             presetSignalLogged = false;
         }
-        catch (UnauthorizedAccessException)
+        catch (UnauthorizedAccessException ex)
         {
             // Unwritable dir: back off (stays queued, retried unblocked).
-            NoteSignalFail();
+            NoteSignalFail(ex, GetPresetSignalPath());
         }
         catch (Exception ex)
         {
             if (ex is IOException ioex && ioex.HResult != unchecked((int)0x80070020))
             {
                 // Real I/O failure, not the transient addon poll lock.
-                NoteSignalFail();
+                NoteSignalFail(ex, GetPresetSignalPath());
                 return;
             }
             if (!presetSignalLogged)
@@ -1326,9 +1326,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                         wroteLock = true;
                     }
                 }
-                catch (UnauthorizedAccessException) { NoteSignalFail(); }
-                catch (IOException ex) when (ex.HResult != unchecked((int)0x80070020)) { NoteSignalFail(); }
-                catch { }
+                catch (UnauthorizedAccessException ex) { NoteSignalFail(ex, GetAnimationSignalPath()); }
+                catch (IOException ex) when (ex.HResult != unchecked((int)0x80070020)) { NoteSignalFail(ex, GetAnimationSignalPath()); }
+                catch (Exception ex) { try { Service.Log.Debug($"[ReshadeController] anim lock transient {ex.HResult:X8}"); } catch { } }
                 if (wroteLock)
                 {
                     _lastAnimWrite = DateTime.UtcNow;
@@ -1397,7 +1397,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 if (!_lastWasEmpty)
                 {
                     try { if (File.Exists(animFileW)) File.Delete(animFileW); _lastWasEmpty = true; }
-                    catch { NoteSignalFail(); }
+                    catch (Exception ex) { NoteSignalFail(ex, animFileW); }
                 }
                 _lastWritten.Clear();
                 _lastLegacyWritten = "\0";
@@ -1416,7 +1416,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                     // Forced but empty (fresh enable on empty content):
                     // ensure absence like the empty branch.
                     try { if (File.Exists(animFileW)) File.Delete(animFileW); wrote = true; _lastWasEmpty = true; }
-                    catch { NoteSignalFail(); }
+                    catch (Exception ex) { NoteSignalFail(ex, animFileW); }
                 }
                 else
                 {
@@ -1427,9 +1427,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                         File.Move(tmp, animFileW, true);
                         wrote = true;
                     }
-                    catch (UnauthorizedAccessException) { NoteSignalFail(); }
-                    catch (IOException ex) when (ex.HResult != unchecked((int)0x80070020)) { NoteSignalFail(); }
-                    catch { }
+                    catch (UnauthorizedAccessException ex) { NoteSignalFail(ex, animFileW); }
+                    catch (IOException ex) when (ex.HResult != unchecked((int)0x80070020)) { NoteSignalFail(ex, animFileW); }
+                    catch (Exception ex) { try { Service.Log.Debug($"[ReshadeController] anim transient {ex.HResult:X8}"); } catch { } }
                     _lastWasEmpty = false;
                 }
                 // Tracker updates land ONLY on successful writes: a failed
@@ -4593,7 +4593,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 _lastSentDynToggles[kvp.Key] = kvp.Value;
             _dynToggleSentThisWindow += diffs.Count;
         }
-        catch { NoteSignalFail(); }
+        catch (Exception ex) { NoteSignalFail(ex, Path.Combine(GetSignalDir(), "ffxiv_reshade_toggle")); }
     }
 
     private unsafe int GetEorzeaSeconds()
@@ -5047,14 +5047,25 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     // updates only land on successful writes so failures can't strand
     // deltas. No time-based blocking, ever (it froze updates for 30s).
     private bool _signalWriteFailed;
-    private void NoteSignalFail()
+    private void NoteSignalFail(Exception? ex = null, string? path = null)
     {
         try
         {
             if (!_signalWriteFailed)
             {
                 _signalWriteFailed = true;
-                try { Service.Log.Warning($"[ReshadeController:{DynamicCanvasWindow.BuildTag}] signal write failed (game folder not writable or transient lock?) — retrying"); } catch { }
+                string detail = "";
+                try
+                {
+                    string name = !string.IsNullOrEmpty(path) ? Path.GetFileName(path) : "?";
+                    string typ = ex != null ? ex.GetType().Name : "unknown";
+                    string hr = (ex != null) ? $"0x{ex.HResult:X8}" : "n/a";
+                    string msg = ex != null ? (ex.Message ?? "") : "";
+                    if (msg.Length > 120) msg = msg.Substring(0, 120);
+                    detail = $" file={name} {typ} hr={hr} msg={msg}";
+                }
+                catch { }
+                try { Service.Log.Warning($"[ReshadeController:{DynamicCanvasWindow.BuildTag}] signal write failed ({detail}) — retrying"); } catch { }
             }
         }
         catch { }
@@ -5083,7 +5094,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException)
         {
-            NoteSignalFail();
+            NoteSignalFail(ex, GetPauseFilePath());
             return false;
         }
         catch { return false; }
