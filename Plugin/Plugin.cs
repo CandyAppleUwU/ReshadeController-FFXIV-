@@ -226,12 +226,16 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             catch { }
             if ((DateTime.UtcNow - lastDaylightClockWrite).TotalMilliseconds < 100) return;
             lastDaylightClockWrite = DateTime.UtcNow;
-            if (SignalWritesBlocked()) return;
             var clockPath = GetDaylightClockPath();
             if (string.IsNullOrEmpty(clockPath)) return;
-            var tmp = clockPath + ".tmp";
-            File.WriteAllText(tmp, GetEorzeaSeconds().ToString());
-            File.Move(tmp, clockPath, true);
+            try
+            {
+                var tmp = clockPath + ".tmp";
+                File.WriteAllText(tmp, GetEorzeaSeconds().ToString());
+                File.Move(tmp, clockPath, true);
+                NoteSignalOk();
+            }
+            catch { NoteSignalFail(); }
         }
         catch { }
     }
@@ -826,7 +830,6 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     private void DrainPresetSignal()
     {
         if (pendingPresetPath == null) return;
-        if (SignalWritesBlocked()) return;
         try
         {
             var file = GetPresetSignalPath();
@@ -1298,33 +1301,45 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             WriteToggleDiffs(mergedTg);
             // Lock path always full-writes while engaged (transient by
             // nature): sync emit trackers to the merged state so the later
-            // single-path deltas continue seamlessly.
+            // single-path deltas continue seamlessly. Tracker sync lands
+            // only on success (see single path).
             if ((DateTime.UtcNow - _lastAnimWrite).TotalMilliseconds >= 25)
             {
-                _lastAnimWrite = DateTime.UtcNow;
-                _lastEmitPreset = (dynData != null) ? (this.configWindow.SelectedPreset ?? "") : "";
-                _lastEmitEnabled = dynData != null && dynData.Enabled;
-                _writesSinceFull = 0;
-                _lastWritten.Clear();
-                foreach (var kvp in mirroredUniforms) _lastWritten[kvp.Key] = kvp.Value;
-                _lastLegacyWritten = legacy;
-                _lastWasEmpty = false;
+                bool wroteLock = false;
                 try
                 {
                     var animFile = GetAnimationSignalPath();
-                    if (merged.Content.Length == 0)
+                    if (!string.IsNullOrEmpty(animFile))
                     {
-                        if (File.Exists(animFile)) File.Delete(animFile);
-                        _lastWasEmpty = true;
-                    }
-                    else
-                    {
-                        var tmp = animFile + ".tmp";
-                        File.WriteAllText(tmp, legacy + merged.Content);
-                        File.Move(tmp, animFile, true);
+                        if (merged.Content.Length == 0)
+                        {
+                            if (File.Exists(animFile)) File.Delete(animFile);
+                            _lastWasEmpty = true;
+                        }
+                        else
+                        {
+                            var tmp = animFile + ".tmp";
+                            File.WriteAllText(tmp, legacy + merged.Content);
+                            File.Move(tmp, animFile, true);
+                            _lastWasEmpty = false;
+                        }
+                        wroteLock = true;
                     }
                 }
+                catch (UnauthorizedAccessException) { NoteSignalFail(); }
+                catch (IOException ex) when (ex.HResult != unchecked((int)0x80070020)) { NoteSignalFail(); }
                 catch { }
+                if (wroteLock)
+                {
+                    _lastAnimWrite = DateTime.UtcNow;
+                    NoteSignalOk();
+                    _lastEmitPreset = (dynData != null) ? (this.configWindow.SelectedPreset ?? "") : "";
+                    _lastEmitEnabled = dynData != null && dynData.Enabled;
+                    _writesSinceFull = 0;
+                    _lastWritten.Clear();
+                    foreach (var kvp in mirroredUniforms) _lastWritten[kvp.Key] = kvp.Value;
+                    _lastLegacyWritten = legacy;
+                }
             }
             if (pfSw != null) { _pfContent = 0; _pfToggles = pfSw.ElapsedTicks; pfSw.Restart(); }
             _pfKeys = mirroredUniforms.Count;
@@ -1366,8 +1381,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         if (pfSw != null) { _pfMirror = pfSw.ElapsedTicks; pfSw.Restart(); }
         // Manual pause holds outputs: touch neither files nor emit
         // trackers (the sim above keeps ticking for a live resume).
-        // Blocked signal writes (unwritable dir) skip everything too.
-        if (!writeHandled && !IsPaused && !SignalWritesBlocked())
+        if (!writeHandled && !IsPaused)
         {
             string curPreset = (dynData != null) ? (this.configWindow.SelectedPreset ?? "") : "";
             bool curEnabled = dynData != null && dynData.Enabled;
@@ -1378,10 +1392,12 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             {
                 // Empty: delete once (coalesced like the old gate), reset
                 // emit trackers so the next content full-emits naturally.
+                // Delete failures stay silent here and retry next frame;
+                // only successful deletes flip the coalescing flag.
                 if (!_lastWasEmpty)
                 {
-                    try { if (File.Exists(animFileW)) File.Delete(animFileW); } catch { NoteSignalFail(); }
-                    _lastWasEmpty = true;
+                    try { if (File.Exists(animFileW)) File.Delete(animFileW); _lastWasEmpty = true; }
+                    catch { NoteSignalFail(); }
                 }
                 _lastWritten.Clear();
                 _lastLegacyWritten = "\0";
@@ -1394,12 +1410,13 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 if ((DateTime.UtcNow - _lastAnimWrite).TotalMilliseconds < 25) return;
                 _lastWasEmpty = false;
                 string toWrite = (_emitFull || legChanged) ? legacy + dynamic : dynamic;
+                bool wrote = false;
                 if (toWrite.Length == 0)
                 {
                     // Forced but empty (fresh enable on empty content):
                     // ensure absence like the empty branch.
-                    try { if (File.Exists(animFileW)) File.Delete(animFileW); } catch { NoteSignalFail(); }
-                    _lastWasEmpty = true;
+                    try { if (File.Exists(animFileW)) File.Delete(animFileW); wrote = true; _lastWasEmpty = true; }
+                    catch { NoteSignalFail(); }
                 }
                 else
                 {
@@ -1408,13 +1425,19 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                         var tmp = animFileW + ".tmp";
                         File.WriteAllText(tmp, toWrite);
                         File.Move(tmp, animFileW, true);
+                        wrote = true;
                     }
                     catch (UnauthorizedAccessException) { NoteSignalFail(); }
                     catch (IOException ex) when (ex.HResult != unchecked((int)0x80070020)) { NoteSignalFail(); }
                     catch { }
                     _lastWasEmpty = false;
                 }
+                // Tracker updates land ONLY on successful writes: a failed
+                // frame must not advance last-written state, or its deltas
+                // get silently dropped on the next compare.
+                if (!wrote) return;
                 _lastAnimWrite = DateTime.UtcNow;
+                NoteSignalOk();
                 _lastEmitPreset = curPreset;
                 _lastEmitEnabled = curEnabled;
                 if (_emitFull)
@@ -4549,11 +4572,11 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             if (diffs.Count >= budget) break;
         }
         if (diffs.Count == 0) return;
-        if (SignalWritesBlocked()) return;
         try
         {
-            var toggleFile = Path.Combine(GetSignalDir(), "ffxiv_reshade_toggle");
-            if (string.IsNullOrEmpty(GetSignalDir())) return;
+            var sigDir = GetSignalDir();
+            if (string.IsNullOrEmpty(sigDir)) return;
+            var toggleFile = Path.Combine(sigDir, "ffxiv_reshade_toggle");
             var lines = new List<string>();
             foreach (var kvp in diffs)
             {
@@ -4565,11 +4588,12 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             var tmp = toggleFile + ".tmp";
             File.WriteAllText(tmp, string.Join("\n", lines) + "\n");
             File.Move(tmp, toggleFile, true);
+            NoteSignalOk();
             foreach (var kvp in diffs)
                 _lastSentDynToggles[kvp.Key] = kvp.Value;
             _dynToggleSentThisWindow += diffs.Count;
         }
-        catch { }
+        catch { NoteSignalFail(); }
     }
 
     private unsafe int GetEorzeaSeconds()
@@ -5017,29 +5041,28 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         catch { return ""; }
     }
 
-    // Signal-write failure backoff: one unwritable dir (Program Files,
-    // full disk, AV lock) must not throw out of OnUpdate every frame.
-    // While blocked, signal writes are skipped; first failure logs once.
-    private DateTime _signalBlockedUntil = DateTime.MinValue;
+    // Signal-write failures (unwritable dir, transient AV/addon locks)
+    // must never throw out of OnUpdate and never freeze the bridge: every
+    // frame retries, the first failure per episode logs once, and tracker
+    // updates only land on successful writes so failures can't strand
+    // deltas. No time-based blocking, ever (it froze updates for 30s).
     private bool _signalWriteFailed;
-    private bool SignalWritesBlocked()
-    {
-        try { return DateTime.UtcNow < _signalBlockedUntil; }
-        catch { return false; }
-    }
-
     private void NoteSignalFail()
     {
         try
         {
-            _signalBlockedUntil = DateTime.UtcNow.AddSeconds(30);
             if (!_signalWriteFailed)
             {
                 _signalWriteFailed = true;
-                try { Service.Log.Warning($"[ReshadeController:{DynamicCanvasWindow.BuildTag}] signal writes failing (game folder not writable?) — bridge paused 30s"); } catch { }
+                try { Service.Log.Warning($"[ReshadeController:{DynamicCanvasWindow.BuildTag}] signal write failed (game folder not writable or transient lock?) — retrying"); } catch { }
             }
         }
         catch { }
+    }
+
+    private void NoteSignalOk()
+    {
+        try { _signalWriteFailed = false; } catch { }
     }
 
     // Central pause-file writer: every producer goes through here so an
@@ -5048,7 +5071,6 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     {
         try
         {
-            if (SignalWritesBlocked()) return false;
             var pauseFile = GetPauseFilePath();
             if (string.IsNullOrEmpty(pauseFile)) return false;
             if (wantPaused)
@@ -5056,7 +5078,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 if (!File.Exists(pauseFile)) File.WriteAllText(pauseFile, "");
             }
             else if (File.Exists(pauseFile)) File.Delete(pauseFile);
-            _signalWriteFailed = false;
+            NoteSignalOk();
             return true;
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException)
