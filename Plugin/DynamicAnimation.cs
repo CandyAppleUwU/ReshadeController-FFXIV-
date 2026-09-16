@@ -944,8 +944,9 @@ public static class DynamicDaylightStore
                 catch { }
             }
             // One-time adoption, in order: legacy game-dir global file,
-            // then a legacy sidecar curve. Adopted data is written forward
-            // to the new home.
+            // sidecar curve, bundled factory default. Adopted data is
+            // written forward to the new home. Personal data always beats
+            // the bundled default; the bundle never overwrites anything.
             if (!HasValues(_cache))
             {
                 try
@@ -973,6 +974,25 @@ public static class DynamicDaylightStore
                 }
                 catch { }
                 return sidecarFallback;
+            }
+            if (!HasValues(_cache))
+            {
+                try
+                {
+                    var asmDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? "";
+                    var bundled = string.IsNullOrEmpty(asmDir) ? "" : Path.Combine(asmDir, "daylight.json");
+                    if (!string.IsNullOrEmpty(bundled) && File.Exists(bundled))
+                    {
+                        var bdl = JsonSerializer.Deserialize<DynamicDaylight>(File.ReadAllText(bundled), JsonOptions);
+                        if (HasValues(bdl))
+                        {
+                            Save(bdl!);
+                            _cache = bdl;
+                            return bdl;
+                        }
+                    }
+                }
+                catch { }
             }
             return HasValues(_cache) ? _cache : HasValues(sidecarFallback) ? sidecarFallback : null;
         }
