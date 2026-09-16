@@ -703,8 +703,11 @@ public class ConfigWindow : Window, IDisposable
                 try { ok = plugin.StartDaylightRecord(); } catch { }
                 try
                 {
+                    var sigDir = Plugin.GetSignalDir();
                     daylightStatus = ok
-                        ? "Armed at 00:00. Run: record --fps 10 --duration 70 -o daylight.csv --region … --eorzea-file <gamedir>\\daylight_clock.txt --go-file <gamedir>\\daylight_go.txt"
+                        ? string.IsNullOrEmpty(sigDir)
+                            ? "Armed at 00:00, but the signal dir is indeterminable."
+                            : $"Armed at 00:00. Run: record --fps 10 --duration 70 -o daylight.csv --region … --eorzea-file \"{Path.Combine(sigDir, "daylight_clock.txt")}\" --go-file \"{Path.Combine(sigDir, "daylight_go.txt")}\""
                         : "Record refused (external time override?).";
                 }
                 catch { }
@@ -753,7 +756,7 @@ public class ConfigWindow : Window, IDisposable
         {
             if (string.IsNullOrEmpty(daylightCsvPath) || !File.Exists(daylightCsvPath))
             {
-                daylightStatus = "CSV not found. Re-record with --eorzea-file <gamedir>\\daylight_clock.txt.";
+                daylightStatus = "CSV not found. Re-record with --eorzea-file pointing at the signal dir (see armed hint).";
                 return;
             }
             var pts = new List<(float Eorzea, float Bright)>();
@@ -830,12 +833,6 @@ public class ConfigWindow : Window, IDisposable
                 if (v > mx) mx = v;
             }
             EnsureDynCache();
-            var gd = GetGameDir();
-            if (string.IsNullOrEmpty(gd))
-            {
-                daylightStatus = "Game dir unknown.";
-                return;
-            }
             var newDl = new DynamicDaylight
             {
                 Values = vals,
@@ -844,7 +841,7 @@ public class ConfigWindow : Window, IDisposable
                 Min = mn,
                 Max = mx,
             };
-            try { DynamicDaylightStore.Save(gd, newDl); } catch (Exception ex) { daylightStatus = "Save failed: " + ex.Message; return; }
+            try { DynamicDaylightStore.Save(newDl); } catch (Exception ex) { daylightStatus = "Save failed: " + ex.Message; return; }
             daylightStatus = $"Imported {pts.Count} samples, {coverage:P0} coverage, range {mn:F0}–{mx:F0} (global).";
         }
         catch (Exception ex) { try { daylightStatus = "Import failed: " + ex.Message; } catch { } }
@@ -1573,6 +1570,33 @@ public class ConfigWindow : Window, IDisposable
 
     private DateTime presetFileReadTime = DateTime.MinValue;
 
+    // Addon ground-truth file, new location first (protocol 2), game dir
+    // as legacy fallback (protocol 1 addons). Newest existing wins so
+    // upgrades and downgrades both resolve to the live writer.
+    private string ResolveTechniquesPath()
+    {
+        try
+        {
+            string best = "";
+            DateTime bestT = DateTime.MinValue;
+            foreach (var dir in new[] { Plugin.GetSignalDir(), GetGameDir() })
+            {
+                if (string.IsNullOrEmpty(dir)) continue;
+                var p = Path.Combine(dir, "ffxiv_reshade_techniques.json");
+                DateTime w;
+                try
+                {
+                    if (!File.Exists(p)) continue;
+                    w = File.GetLastWriteTimeUtc(p);
+                }
+                catch { continue; }
+                if (string.IsNullOrEmpty(best) || w > bestT) { best = p; bestT = w; }
+            }
+            return best;
+        }
+        catch { return ""; }
+    }
+
     // Follow ReShade's live preset: zone switches and overlay switches
     // change it behind our back. Runs headless from the framework thread
     // (not just Draw) so the engine learns the active preset even when
@@ -1582,12 +1606,26 @@ public class ConfigWindow : Window, IDisposable
     {
         try
         {
-            var path = Path.Combine(GetGameDir(), "ffxiv_reshade_techniques.json");
-            if (!File.Exists(path)) return;
+            var path = ResolveTechniquesPath();
+            if (string.IsNullOrEmpty(path)) return;
             var mtime = File.GetLastWriteTimeUtc(path);
             if (mtime <= presetFileReadTime) return;
             presetFileReadTime = mtime;
             using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+            try
+            {
+                int proto = 1;
+                string aver = "unknown";
+                if (doc.RootElement.TryGetProperty("protocol", out var pel) && pel.ValueKind == System.Text.Json.JsonValueKind.Number && pel.TryGetInt32(out int pv) && pv >= 1)
+                    proto = pv;
+                if (doc.RootElement.TryGetProperty("addon", out var ael) && ael.ValueKind == System.Text.Json.JsonValueKind.String)
+                {
+                    var av = ael.GetString() ?? "";
+                    if (!string.IsNullOrEmpty(av)) aver = av;
+                }
+                plugin.NoteAddonVersion(proto, aver);
+            }
+            catch { }
             if (doc.RootElement.TryGetProperty("preset", out var presetEl))
             {
                 var activePreset = presetEl.GetString() ?? "";
@@ -1613,12 +1651,26 @@ public class ConfigWindow : Window, IDisposable
         try
         {
             FollowLivePreset();
-            var path = Path.Combine(GetGameDir(), "ffxiv_reshade_techniques.json");
-            if (!File.Exists(path)) return;
+            var path = ResolveTechniquesPath();
+            if (string.IsNullOrEmpty(path)) return;
             var mtime = File.GetLastWriteTimeUtc(path);
             if (mtime <= techFileReadTime) return;
             techFileReadTime = mtime;
             using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+            try
+            {
+                int proto = 1;
+                string aver = "unknown";
+                if (doc.RootElement.TryGetProperty("protocol", out var pel2) && pel2.ValueKind == System.Text.Json.JsonValueKind.Number && pel2.TryGetInt32(out int pv2) && pv2 >= 1)
+                    proto = pv2;
+                if (doc.RootElement.TryGetProperty("addon", out var ael2) && ael2.ValueKind == System.Text.Json.JsonValueKind.String)
+                {
+                    var av2 = ael2.GetString() ?? "";
+                    if (!string.IsNullOrEmpty(av2)) aver = av2;
+                }
+                plugin.NoteAddonVersion(proto, aver);
+            }
+            catch { }
             if (!doc.RootElement.TryGetProperty("effects", out var arr)) return;
             var fresh = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             var seenNow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -2555,7 +2607,12 @@ public class ConfigWindow : Window, IDisposable
         }
         if (toggleLines.Count > 0)
         {
-            try { AtomicWriteText(Path.Combine(GetGameDir(), "ffxiv_reshade_toggle"), string.Join("\n", toggleLines) + "\n"); } catch { }
+            try
+            {
+                var toggleFile = ToggleSignalPath();
+                if (!string.IsNullOrEmpty(toggleFile)) AtomicWriteText(toggleFile, string.Join("\n", toggleLines) + "\n");
+            }
+            catch { }
         }
         var uniVals = new Dictionary<string, (string Value, string BaseType)>(StringComparer.OrdinalIgnoreCase);
         if (pk != null)
@@ -2619,12 +2676,7 @@ public class ConfigWindow : Window, IDisposable
     public DynamicDaylight? ActiveDaylight() => ActiveDaylight(activeDynData);
     public DynamicDaylight? ActiveDaylight(DynamicPresetData? data)
     {
-        try
-        {
-            var gd = GetGameDir();
-            if (string.IsNullOrEmpty(gd)) return data?.Daylight;
-            return DynamicDaylightStore.Load(gd, data?.Daylight);
-        }
+        try { return DynamicDaylightStore.Load(data?.Daylight); }
         catch { return data?.Daylight; }
     }
     public int GetEorzeaSec() => plugin.GetEorzeaSecondsPublic();
@@ -2693,6 +2745,30 @@ public class ConfigWindow : Window, IDisposable
         cfg.Keyframes.Sort((a, b) => a.TimeSeconds.CompareTo(b.TimeSeconds));
     }
 
+    // Addon bridge status: missing ground-truth file = addon not detected
+    // (amber); protocol older than ours = outdated bundle (red). Silent
+    // when healthy so the tab stays quiet.
+    private void DrawAddonStatusBanner()
+    {
+        try
+        {
+            bool seen = false;
+            int proto = 1;
+            string aver = "unknown";
+            try { seen = plugin.TechlistSeen; proto = plugin.AddonProtocol; aver = plugin.AddonVersionString; } catch { }
+            if (seen && proto >= Plugin.BridgeProtocol) return;
+            if (!seen)
+            {
+                ImGui.TextColored(new Vector4(1f, 0.75f, 0.3f, 1f), "ReShade addon not detected — install reshade_controller.addon in the game folder (toggles/uniforms won't apply).");
+            }
+            else
+            {
+                ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), $"ReShade addon outdated (v{aver}, protocol {proto}) — update the game bundle to match the plugin.");
+            }
+        }
+        catch { }
+    }
+
     private void DrawDynamicSection()
     {
         if (string.IsNullOrEmpty(selectedPresetPath) || !IsDynamicPreset(selectedPresetPath)) return;
@@ -2731,7 +2807,12 @@ public class ConfigWindow : Window, IDisposable
 
     private void WriteToggleSignal(string effectFile, string techName, bool enabled)
     {
-        try { AtomicWriteText(Path.Combine(GetGameDir(), "ffxiv_reshade_toggle"), $"{effectFile}|{techName}|{(enabled ? "1" : "0")}\n"); } catch { }
+        try
+        {
+            var toggleFile = ToggleSignalPath();
+            if (!string.IsNullOrEmpty(toggleFile)) AtomicWriteText(toggleFile, $"{effectFile}|{techName}|{(enabled ? "1" : "0")}\n");
+        }
+        catch { }
     }
 
     // The display shows each technique once, so the model must too:
@@ -3184,6 +3265,7 @@ public class ConfigWindow : Window, IDisposable
         EnsureDynCache();
         if (sidecarDirty && (DateTime.UtcNow - lastSidecarSave).TotalSeconds > 2)
             FlushDynSidecar();
+        DrawAddonStatusBanner();
         ImGui.Text("Preset:"); ImGui.SameLine(); ImGui.SetNextItemWidth(350);
         if (ImGui.BeginCombo("##reshadePreset", string.IsNullOrEmpty(selectedPresetPath) ? "Select preset..." : GetPresetDisplayName(selectedPresetPath), ImGuiComboFlags.HeightLargest))
         {
@@ -4287,12 +4369,35 @@ public class ConfigWindow : Window, IDisposable
         if (cmds.Count == 0) return;
         try
         {
-            var cmdFile = Path.Combine(
-                Path.GetDirectoryName(Environment.ProcessPath) ?? "",
-                "ffxiv_reshade_cmd.txt");
+            var cmdFile = CmdSignalPath();
+            if (string.IsNullOrEmpty(cmdFile)) return;
             AtomicWriteText(cmdFile, string.Join("\n", cmds) + "\n");
         }
         catch { }
+    }
+
+    // Plugin→addon toggle signal path (protocol 2 signal dir). Empty when
+    // indeterminable; callers treat empty as skip (never CWD-relative).
+    private static string ToggleSignalPath()
+    {
+        try
+        {
+            var dir = Plugin.GetSignalDir();
+            if (string.IsNullOrEmpty(dir)) return "";
+            return Path.Combine(dir, "ffxiv_reshade_toggle");
+        }
+        catch { return ""; }
+    }
+
+    private static string CmdSignalPath()
+    {
+        try
+        {
+            var dir = Plugin.GetSignalDir();
+            if (string.IsNullOrEmpty(dir)) return "";
+            return Path.Combine(dir, "ffxiv_reshade_cmd.txt");
+        }
+        catch { return ""; }
     }
 
     // Default comparison tolerant of formatting ("0.5" vs "0.5000"),

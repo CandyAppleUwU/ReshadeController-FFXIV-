@@ -130,10 +130,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
     public static string GetDaylightClockPath()
     {
-        var processPath = Environment.ProcessPath;
-        if (string.IsNullOrEmpty(processPath))
-            throw new InvalidOperationException("Cannot determine game path.");
-        return Path.Combine(Path.GetDirectoryName(processPath)!, "daylight_clock.txt");
+        var dir = GetSignalDir();
+        if (string.IsNullOrEmpty(dir)) return "";
+        return Path.Combine(dir, "daylight_clock.txt");
     }
 
     // Fired by the external recorder: it writes this file the moment the
@@ -141,10 +140,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     // alt-tab race. Only honored while armed; always consumed.
     public static string GetDaylightGoPath()
     {
-        var processPath = Environment.ProcessPath;
-        if (string.IsNullOrEmpty(processPath))
-            throw new InvalidOperationException("Cannot determine game path.");
-        return Path.Combine(Path.GetDirectoryName(processPath)!, "daylight_go.txt");
+        var dir = GetSignalDir();
+        if (string.IsNullOrEmpty(dir)) return "";
+        return Path.Combine(dir, "daylight_go.txt");
     }
 
     public bool StartDaylightRecord()
@@ -210,7 +208,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             try
             {
                 var go = GetDaylightGoPath();
-                if (File.Exists(go))
+                if (!string.IsNullOrEmpty(go) && File.Exists(go))
                 {
                     try { File.Delete(go); } catch { }
                     if (Weather.EnableTime(0))
@@ -228,9 +226,12 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             catch { }
             if ((DateTime.UtcNow - lastDaylightClockWrite).TotalMilliseconds < 100) return;
             lastDaylightClockWrite = DateTime.UtcNow;
-            var tmp = GetDaylightClockPath() + ".tmp";
+            if (SignalWritesBlocked()) return;
+            var clockPath = GetDaylightClockPath();
+            if (string.IsNullOrEmpty(clockPath)) return;
+            var tmp = clockPath + ".tmp";
             File.WriteAllText(tmp, GetEorzeaSeconds().ToString());
-            File.Move(tmp, GetDaylightClockPath(), true);
+            File.Move(tmp, clockPath, true);
         }
         catch { }
     }
@@ -415,10 +416,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
         try
         {
-            var processPath = Environment.ProcessPath;
-            if (!string.IsNullOrEmpty(processPath))
+            var dir = GetSignalDir();
+            if (!string.IsNullOrEmpty(dir))
             {
-                var dir = Path.GetDirectoryName(processPath)!;
                 var cmdPath = Path.Combine(dir, "ffxiv_reshade_cmd.txt");
                 try
                 {
@@ -826,9 +826,11 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     private void DrainPresetSignal()
     {
         if (pendingPresetPath == null) return;
+        if (SignalWritesBlocked()) return;
         try
         {
             var file = GetPresetSignalPath();
+            if (string.IsNullOrEmpty(file)) return;
             if (string.IsNullOrEmpty(pendingPresetContent))
             {
                 if (File.Exists(file)) File.Delete(file);
@@ -842,8 +844,19 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             pendingPresetPath = null;
             presetSignalLogged = false;
         }
-        catch
+        catch (UnauthorizedAccessException)
         {
+            // Unwritable dir: back off (stays queued, retried unblocked).
+            NoteSignalFail();
+        }
+        catch (Exception ex)
+        {
+            if (ex is IOException ioex && ioex.HResult != unchecked((int)0x80070020))
+            {
+                // Real I/O failure, not the transient addon poll lock.
+                NoteSignalFail();
+                return;
+            }
             if (!presetSignalLogged)
             {
                 presetSignalLogged = true;
@@ -883,12 +896,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
     // curves are legacy fallback + one-time adoption seed).
     private DynamicDaylight? ResolveDaylight(DynamicPresetData? data)
     {
-        try
-        {
-            var gd = Path.GetDirectoryName(Environment.ProcessPath) ?? "";
-            if (string.IsNullOrEmpty(gd)) return data?.Daylight;
-            return DynamicDaylightStore.Load(gd, data?.Daylight);
-        }
+        try { return DynamicDaylightStore.Load(data?.Daylight); }
         catch { return data?.Daylight; }
     }
 
@@ -1009,11 +1017,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             bool hotkeyPressed = keyDown && modMatch;
             if (hotkeyPressed && !lastHotkeyState)
             {
-                var pauseFile = GetPauseFilePath();
-                if (File.Exists(pauseFile))
-                    File.Delete(pauseFile);
-                else
-                    File.WriteAllText(pauseFile, "");
+                SetPauseFile(!IsPaused);
             }
             lastHotkeyState = hotkeyPressed;
         }
@@ -1065,21 +1069,13 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         if (globalPause != lastGlobalPause)
         {
             lastGlobalPause = globalPause;
-            var pauseFile = GetPauseFilePath();
-
             if (globalPause)
             {
-                if (!File.Exists(pauseFile))
-                {
-                    File.WriteAllText(pauseFile, "");
-                }
+                SetPauseFile(true);
             }
             else
             {
-                if (File.Exists(pauseFile))
-                {
-                    File.Delete(pauseFile);
-                }
+                SetPauseFile(false);
                 // Loads happen behind a black screen: discard pending time
                 // fade windows and sync states, so values snap instantly
                 // instead of gliding into the new zone. In-flight trigger
@@ -1199,22 +1195,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 if (state == lastState) return;
 
                 lastState = state;
-                var pauseFile = GetPauseFilePath();
-
-                if (state)
-                {
-                    if (!File.Exists(pauseFile))
-                    {
-                        File.WriteAllText(pauseFile, "");
-                    }
-                }
-                else
-                {
-                    if (File.Exists(pauseFile))
-                    {
-                        File.Delete(pauseFile);
-                    }
-                }
+                SetPauseFile(state);
             }
             catch { }
         }
@@ -1385,18 +1366,21 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         if (pfSw != null) { _pfMirror = pfSw.ElapsedTicks; pfSw.Restart(); }
         // Manual pause holds outputs: touch neither files nor emit
         // trackers (the sim above keeps ticking for a live resume).
-        if (!writeHandled && !IsPaused)
+        // Blocked signal writes (unwritable dir) skip everything too.
+        if (!writeHandled && !IsPaused && !SignalWritesBlocked())
         {
             string curPreset = (dynData != null) ? (this.configWindow.SelectedPreset ?? "") : "";
             bool curEnabled = dynData != null && dynData.Enabled;
             bool legChanged = !string.Equals(legacy, _lastLegacyWritten, StringComparison.Ordinal);
+            string animFileW = GetAnimationSignalPath();
+            if (string.IsNullOrEmpty(animFileW)) return;
             if (dynamic.Length == 0 && legacy.Length == 0)
             {
                 // Empty: delete once (coalesced like the old gate), reset
                 // emit trackers so the next content full-emits naturally.
                 if (!_lastWasEmpty)
                 {
-                    try { var af0 = GetAnimationSignalPath(); if (File.Exists(af0)) File.Delete(af0); } catch { }
+                    try { if (File.Exists(animFileW)) File.Delete(animFileW); } catch { NoteSignalFail(); }
                     _lastWasEmpty = true;
                 }
                 _lastWritten.Clear();
@@ -1414,18 +1398,19 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
                 {
                     // Forced but empty (fresh enable on empty content):
                     // ensure absence like the empty branch.
-                    try { var af1 = GetAnimationSignalPath(); if (File.Exists(af1)) File.Delete(af1); } catch { }
+                    try { if (File.Exists(animFileW)) File.Delete(animFileW); } catch { NoteSignalFail(); }
                     _lastWasEmpty = true;
                 }
                 else
                 {
                     try
                     {
-                        var animFile = GetAnimationSignalPath();
-                        var tmp = animFile + ".tmp";
+                        var tmp = animFileW + ".tmp";
                         File.WriteAllText(tmp, toWrite);
-                        File.Move(tmp, animFile, true);
+                        File.Move(tmp, animFileW, true);
                     }
+                    catch (UnauthorizedAccessException) { NoteSignalFail(); }
+                    catch (IOException ex) when (ex.HResult != unchecked((int)0x80070020)) { NoteSignalFail(); }
                     catch { }
                     _lastWasEmpty = false;
                 }
@@ -4564,10 +4549,11 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             if (diffs.Count >= budget) break;
         }
         if (diffs.Count == 0) return;
+        if (SignalWritesBlocked()) return;
         try
         {
-            var dir = Path.GetDirectoryName(Environment.ProcessPath) ?? "";
-            var toggleFile = Path.Combine(dir, "ffxiv_reshade_toggle");
+            var toggleFile = Path.Combine(GetSignalDir(), "ffxiv_reshade_toggle");
+            if (string.IsNullOrEmpty(GetSignalDir())) return;
             var lines = new List<string>();
             foreach (var kvp in diffs)
             {
@@ -4712,7 +4698,6 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         QueuePresetSignal(presetPath ?? "");
 
         // Write pause signal
-        var pauseFile = GetPauseFilePath();
         bool shouldPause = zonePreset?.ConditionSetIndex >= 0;
         if (shouldPause)
         {
@@ -4731,14 +4716,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             catch { }
         }
 
-        if (shouldPause && !File.Exists(pauseFile))
-        {
-            File.WriteAllText(pauseFile, "");
-        }
-        else if (!shouldPause && File.Exists(pauseFile))
-        {
-            File.Delete(pauseFile);
-        }
+        SetPauseFile(shouldPause);
     }
 
     public void RefreshConditionSets()
@@ -4873,34 +4851,26 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
             case "pause":
                 if (File.Exists(pauseFile))
                     this.chatGui.Print("[Reshade] Already paused.");
-                else
-                {
-                    File.WriteAllText(pauseFile, "");
+                else if (SetPauseFile(true))
                     this.chatGui.Print("[Reshade] Shaders paused.");
-                }
+                else
+                    this.chatGui.Print("[Reshade] Pause failed: signal file unwritable.");
                 break;
 
             case "resume":
                 if (!File.Exists(pauseFile))
                     this.chatGui.Print("[Reshade] Already running.");
-                else
-                {
-                    File.Delete(pauseFile);
+                else if (SetPauseFile(false))
                     this.chatGui.Print("[Reshade] Shaders resumed.");
-                }
+                else
+                    this.chatGui.Print("[Reshade] Resume failed: signal file unwritable.");
                 break;
 
             case "toggle":
-                if (File.Exists(pauseFile))
-                {
-                    File.Delete(pauseFile);
-                    this.chatGui.Print("[Reshade] Shaders resumed.");
-                }
+                if (SetPauseFile(!IsPaused))
+                    this.chatGui.Print(IsPaused ? "[Reshade] Shaders paused." : "[Reshade] Shaders resumed.");
                 else
-                {
-                    File.WriteAllText(pauseFile, "");
-                    this.chatGui.Print("[Reshade] Shaders paused.");
-                }
+                    this.chatGui.Print("[Reshade] Toggle failed: signal file unwritable.");
                 break;
 
             case "status":
@@ -4968,30 +4938,153 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
         }
     }
 
+    // Bridge protocol versions (see Addon/dllmain.cpp RC_PROTOCOL).
+    // 1 = game-dir signal files (legacy), 2 = signal dir below.
+    public const int BridgeProtocol = 2;
+    public const int MinBridgeProtocol = 1;
+    // Addon version as last reported via techniques.json ("unknown" when
+    // the file is missing or predates versioning). Protocol < BridgeProtocol
+    // (or unknown) drives the outdated-addon warning, never behavior.
+    public int AddonProtocol { get; private set; } = 1;
+    public string AddonVersionString { get; private set; } = "unknown";
+    private string _lastAddonWarnState = "";
+    private bool _techlistEverSeen;
+
+    // Called whenever the addon ground-truth file parses (both readers).
+    // Tracks what the addon claims + warns once per state (never per frame).
+    // Missing file = never called = TechlistSeen stays false (UI shows
+    // "not detected" from that, not from here).
+    public bool TechlistSeen => _techlistEverSeen;
+    public void NoteAddonVersion(int protocol, string version)
+    {
+        try
+        {
+            if (protocol >= 1) AddonProtocol = protocol;
+            if (!string.IsNullOrEmpty(version)) AddonVersionString = version;
+            _techlistEverSeen = true;
+            string state = AddonProtocol < BridgeProtocol ? "old" : "ok";
+            if (state == _lastAddonWarnState) return;
+            _lastAddonWarnState = state;
+            if (state == "old")
+            {
+                try { Service.Log.Warning($"[ReshadeController:{DynamicCanvasWindow.BuildTag}] ReShade addon outdated (protocol {AddonProtocol}, need {BridgeProtocol}) — update the game bundle; signal files moved"); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    // Signal-file home: %LOCALAPPDATA%\ReshadeController (protocol 2).
+    // Program Files game dirs reject writes (UnauthorizedAccessException
+    // every frame); both sides compute this identically without config.
+    // Computed once per session; "" when indeterminable (callers guard).
+    private static string _signalDir = "";
+    private static bool _signalDirDone;
+    public static string GetSignalDir()
+    {
+        if (_signalDirDone) return _signalDir;
+        try
+        {
+            var lad = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!string.IsNullOrEmpty(lad))
+            {
+                var cand = Path.Combine(lad, "ReshadeController");
+                Directory.CreateDirectory(cand);
+                if (Directory.Exists(cand)) { _signalDir = cand; _signalDirDone = true; return cand; }
+            }
+        }
+        catch { }
+        try
+        {
+            var pp = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(pp))
+            {
+                var gd = Path.GetDirectoryName(pp);
+                if (!string.IsNullOrEmpty(gd)) { _signalDir = gd; _signalDirDone = true; return gd; }
+            }
+        }
+        catch { }
+        return "";
+    }
+
+    public static string GetGameDir()
+    {
+        try
+        {
+            var pp = Environment.ProcessPath;
+            if (string.IsNullOrEmpty(pp)) return "";
+            return Path.GetDirectoryName(pp) ?? "";
+        }
+        catch { return ""; }
+    }
+
+    // Signal-write failure backoff: one unwritable dir (Program Files,
+    // full disk, AV lock) must not throw out of OnUpdate every frame.
+    // While blocked, signal writes are skipped; first failure logs once.
+    private DateTime _signalBlockedUntil = DateTime.MinValue;
+    private bool _signalWriteFailed;
+    private bool SignalWritesBlocked()
+    {
+        try { return DateTime.UtcNow < _signalBlockedUntil; }
+        catch { return false; }
+    }
+
+    private void NoteSignalFail()
+    {
+        try
+        {
+            _signalBlockedUntil = DateTime.UtcNow.AddSeconds(30);
+            if (!_signalWriteFailed)
+            {
+                _signalWriteFailed = true;
+                try { Service.Log.Warning($"[ReshadeController:{DynamicCanvasWindow.BuildTag}] signal writes failing (game folder not writable?) — bridge paused 30s"); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    // Central pause-file writer: every producer goes through here so an
+    // unwritable dir degrades instead of throwing. Returns success.
+    private bool SetPauseFile(bool wantPaused)
+    {
+        try
+        {
+            if (SignalWritesBlocked()) return false;
+            var pauseFile = GetPauseFilePath();
+            if (string.IsNullOrEmpty(pauseFile)) return false;
+            if (wantPaused)
+            {
+                if (!File.Exists(pauseFile)) File.WriteAllText(pauseFile, "");
+            }
+            else if (File.Exists(pauseFile)) File.Delete(pauseFile);
+            _signalWriteFailed = false;
+            return true;
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException)
+        {
+            NoteSignalFail();
+            return false;
+        }
+        catch { return false; }
+    }
+
     public static string GetPauseFilePath()
     {
-        var processPath = Environment.ProcessPath;
-        if (string.IsNullOrEmpty(processPath))
-            throw new InvalidOperationException("Cannot determine game path.");
-        var dir = Path.GetDirectoryName(processPath)!;
+        var dir = GetSignalDir();
+        if (string.IsNullOrEmpty(dir)) return "";
         return Path.Combine(dir, "ffxiv_reshade_pause");
     }
 
     public static string GetPresetSignalPath()
     {
-        var processPath = Environment.ProcessPath;
-        if (string.IsNullOrEmpty(processPath))
-            throw new InvalidOperationException("Cannot determine game path.");
-        var dir = Path.GetDirectoryName(processPath)!;
+        var dir = GetSignalDir();
+        if (string.IsNullOrEmpty(dir)) return "";
         return Path.Combine(dir, "ffxiv_reshade_preset");
     }
 
     public static string GetAnimationSignalPath()
     {
-        var processPath = Environment.ProcessPath;
-        if (string.IsNullOrEmpty(processPath))
-            throw new InvalidOperationException("Cannot determine game path.");
-        var dir = Path.GetDirectoryName(processPath)!;
+        var dir = GetSignalDir();
+        if (string.IsNullOrEmpty(dir)) return "";
         return Path.Combine(dir, "ffxiv_reshade_anim");
     }
 

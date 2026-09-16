@@ -32,6 +32,12 @@ static std::string g_state_file_path;
 static std::string g_cmd_file_path;
 static std::string g_toggle_file_path;
 static std::string g_techlist_file_path;
+// Bridge protocol: 1 = game-dir signal files (legacy), 2 = data dir below.
+#define RC_PROTOCOL 2
+#define RC_PROTOCOL_STR "2"
+#define RC_ADDON_VERSION "1.0.0"
+// Game-dir fallback for transition reads (old plugin still writing there).
+static std::string g_exe_dir;
 static std::atomic<bool> g_refresh_techlist{true};
 static std::string g_last_preset;
 static uint64_t g_last_preset_counter = 0;
@@ -172,6 +178,49 @@ static void write_file(const std::string &path, const std::string &content)
 static void delete_file(const std::string &path)
 {
 	DeleteFileA(path.c_str());
+}
+
+// Signal-file home: %LOCALAPPDATA%\ReshadeController (always writable;
+// Program Files game dirs are not). Falls back to the exe dir when the
+// env var is missing or the directory can't be established.
+static std::string get_data_dir(const std::string &exeDir)
+{
+	const char *lad = getenv("LOCALAPPDATA");
+	if (lad != nullptr && lad[0] != '\0')
+	{
+		try
+		{
+			std::string cand = std::string(lad) + "\\ReshadeController";
+			std::error_code ec;
+			std::filesystem::create_directories(cand, ec);
+			std::error_code ec2;
+			if (!ec && std::filesystem::is_directory(cand, ec2)) return cand;
+		}
+		catch (...) {}
+	}
+	return exeDir;
+}
+
+// Legacy game-dir path for a data-dir signal file (transition reads for
+// old plugins still writing there; empty content ≡ absent everywhere, so
+// falling back on empty is safe).
+static std::string legacy_path(const std::string &primary)
+{
+	if (g_exe_dir.empty()) return "";
+	size_t sep = primary.find_last_of("\\/");
+	if (sep == std::string::npos) return "";
+	std::string leg = g_exe_dir + "\\" + primary.substr(sep + 1);
+	if (leg == primary) return "";
+	return leg;
+}
+
+static std::string read_signal_file(const std::string &primary)
+{
+	std::string c = read_file(primary);
+	if (!c.empty()) return c;
+	std::string leg = legacy_path(primary);
+	if (leg.empty()) return c;
+	return read_file(leg);
 }
 
 static bool atomic_write_file(const std::string &path, const std::string &content)
@@ -506,7 +555,7 @@ static void check_anim_signal()
 {
 	if (g_anim_file_path.empty()) return;
 
-	std::string content = read_file(g_anim_file_path);
+	std::string content = read_signal_file(g_anim_file_path);
 	if (content.empty())
 	{
 		std::lock_guard<std::mutex> lock(g_anim_mutex);
@@ -576,10 +625,11 @@ static void check_command_file()
 {
 	if (g_cmd_file_path.empty()) return;
 
-	std::string content = read_file(g_cmd_file_path);
+	std::string content = read_signal_file(g_cmd_file_path);
 	if (content.empty()) return;
 
 	delete_file(g_cmd_file_path);
+	{ std::string leg = legacy_path(g_cmd_file_path); if (!leg.empty()) delete_file(leg); }
 
 	std::istringstream iss(content);
 	std::string line;
@@ -930,7 +980,7 @@ static void check_preset_signal()
 {
 	if (g_preset_file_path.empty()) return;
 
-	std::string raw = read_file(g_preset_file_path);
+	std::string raw = read_signal_file(g_preset_file_path);
 	if (raw.empty()) return;
 
 	while (!raw.empty() && (raw.back() == '\r' || raw.back() == '\n' || raw.back() == ' '))
@@ -970,10 +1020,11 @@ static void check_toggle_signal()
 {
 	if (g_toggle_file_path.empty()) return;
 
-	std::string content = read_file(g_toggle_file_path);
+	std::string content = read_signal_file(g_toggle_file_path);
 	if (content.empty()) return;
 
 	delete_file(g_toggle_file_path);
+	{ std::string leg = legacy_path(g_toggle_file_path); if (!leg.empty()) delete_file(leg); }
 
 	std::istringstream iss(content);
 	std::string line;
@@ -1045,7 +1096,7 @@ static void write_technique_list(reshade::api::effect_runtime *runtime)
 		char curPreset[512] = {};
 		try { runtime->get_current_preset_path(curPreset); } catch (...) { curPreset[0] = '\0'; }
 		std::ostringstream json;
-		json << "{\"preset\":\"" << json_escape(curPreset) << "\",\"effects\":[";
+		json << "{\"preset\":\"" << json_escape(curPreset) << "\",\"protocol\":" << RC_PROTOCOL << ",\"addon\":\"" << RC_ADDON_VERSION << "\",\"effects\":[";
 		bool first = true;
 		runtime->enumerate_techniques(nullptr, [&](reshade::api::effect_runtime *rt, auto technique) {
 			// Mirror the ReShade UI: techniques annotated hidden=true are
@@ -1141,9 +1192,19 @@ static void poll_thread()
 
 		if (g_pause_file_path.empty()) continue;
 
-		// Check pause signal (atomics only, no ReShade API)
+		// Check pause signal (atomics only, no ReShade API). Game-dir
+		// fallback for old plugins still writing there.
 		DWORD attr = GetFileAttributesA(g_pause_file_path.c_str());
 		bool file_exists = (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+		if (!file_exists)
+		{
+			std::string leg = legacy_path(g_pause_file_path);
+			if (!leg.empty())
+			{
+				DWORD lattr = GetFileAttributesA(leg.c_str());
+				file_exists = (lattr != INVALID_FILE_ATTRIBUTES && !(lattr & FILE_ATTRIBUTE_DIRECTORY));
+			}
+		}
 		g_should_pause.store(file_exists);
 
 		// Read signal files and queue commands (file I/O only, no ReShade API)
@@ -1174,13 +1235,15 @@ static void on_init(reshade::api::effect_runtime *runtime)
 {
 	g_runtime = runtime;
 	std::string dir = get_exe_dir();
-	g_pause_file_path = dir + "\\ffxiv_reshade_pause";
-	g_preset_file_path = dir + "\\ffxiv_reshade_preset";
-	g_anim_file_path = dir + "\\ffxiv_reshade_anim";
-	g_state_file_path = dir + "\\ffxiv_reshade_state.json";
-	g_cmd_file_path = dir + "\\ffxiv_reshade_cmd.txt";
-	g_toggle_file_path = dir + "\\ffxiv_reshade_toggle";
-	g_techlist_file_path = dir + "\\ffxiv_reshade_techniques.json";
+	g_exe_dir = dir;
+	std::string sigdir = get_data_dir(dir);
+	g_pause_file_path = sigdir + "\\ffxiv_reshade_pause";
+	g_preset_file_path = sigdir + "\\ffxiv_reshade_preset";
+	g_anim_file_path = sigdir + "\\ffxiv_reshade_anim";
+	g_state_file_path = sigdir + "\\ffxiv_reshade_state.json";
+	g_cmd_file_path = sigdir + "\\ffxiv_reshade_cmd.txt";
+	g_toggle_file_path = sigdir + "\\ffxiv_reshade_toggle";
+	g_techlist_file_path = sigdir + "\\ffxiv_reshade_techniques.json";
 
 	try
 	{
@@ -1194,8 +1257,18 @@ static void on_init(reshade::api::effect_runtime *runtime)
 	delete_file(g_state_file_path);
 	delete_file(g_toggle_file_path);
 	delete_file(g_techlist_file_path);
+	if (sigdir != dir)
+	{
+		// Transition cleanup: stale game-dir signals an old plugin left.
+		delete_file(dir + "\\ffxiv_reshade_preset");
+		delete_file(dir + "\\ffxiv_reshade_anim");
+		delete_file(dir + "\\ffxiv_reshade_state.json");
+		delete_file(dir + "\\ffxiv_reshade_toggle");
+		delete_file(dir + "\\ffxiv_reshade_techniques.json");
+		delete_file(dir + "\\ffxiv_reshade_cmd.txt");
+	}
 
-	reshade::log::message(reshade::log::level::info, "reshade_controller: initialized v4-present-step-log");
+	reshade::log::message(reshade::log::level::info, ("reshade_controller: initialized (addon " RC_ADDON_VERSION ", protocol " RC_PROTOCOL_STR ", signals " + sigdir + ")").c_str());
 
 	std::thread(poll_thread).detach();
 }

@@ -898,7 +898,9 @@ public static class DynamicDaylightStore
     private static DateTime _cacheWrite = DateTime.MinValue;
     private static string _cachePath = "";
 
-    public static string GlobalPath(string gameDir) => Path.Combine(gameDir, "daylight.json");
+    // Global curve home (protocol 2 signal dir). Legacy game-dir copies
+    // (shipped installs) are adopted once, then ignored.
+    public static string GlobalPath() => Path.Combine(Plugin.GetSignalDir(), "daylight.json");
 
     private static bool HasValues(DynamicDaylight? dl)
     {
@@ -906,12 +908,23 @@ public static class DynamicDaylightStore
         catch { return false; }
     }
 
-    public static DynamicDaylight? Load(string gameDir, DynamicDaylight? sidecarFallback = null)
+    private static string LegacyGlobalPath()
     {
         try
         {
-            var path = GlobalPath(gameDir);
-            if (File.Exists(path))
+            var gd = Plugin.GetGameDir();
+            if (string.IsNullOrEmpty(gd)) return "";
+            return Path.Combine(gd, "daylight.json");
+        }
+        catch { return ""; }
+    }
+
+    public static DynamicDaylight? Load(DynamicDaylight? sidecarFallback = null)
+    {
+        try
+        {
+            var path = GlobalPath();
+            if (!string.IsNullOrEmpty(path) && File.Exists(path))
             {
                 DateTime w;
                 try { w = File.GetLastWriteTimeUtc(path); } catch { w = DateTime.MinValue; }
@@ -930,31 +943,48 @@ public static class DynamicDaylightStore
                 }
                 catch { }
             }
-            // One-time adoption: a legacy sidecar curve seeds the global file.
-            if (HasValues(sidecarFallback))
+            // One-time adoption, in order: legacy game-dir global file,
+            // then a legacy sidecar curve. Adopted data is written forward
+            // to the new home.
+            if (!HasValues(_cache))
             {
                 try
                 {
-                    var tmp = path + ".tmp";
-                    File.WriteAllText(tmp, JsonSerializer.Serialize(sidecarFallback, JsonOptions));
-                    File.Move(tmp, path, true);
-                    try { _cacheWrite = File.GetLastWriteTimeUtc(path); } catch { _cacheWrite = DateTime.UtcNow; }
+                    var leg = LegacyGlobalPath();
+                    if (!string.IsNullOrEmpty(leg) && File.Exists(leg))
+                    {
+                        var ldl = JsonSerializer.Deserialize<DynamicDaylight>(File.ReadAllText(leg), JsonOptions);
+                        if (HasValues(ldl))
+                        {
+                            Save(ldl!);
+                            _cache = ldl;
+                            return ldl;
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (HasValues(sidecarFallback) && !HasValues(_cache))
+            {
+                try
+                {
+                    Save(sidecarFallback!);
                     _cache = sidecarFallback;
-                    _cachePath = path;
                 }
                 catch { }
                 return sidecarFallback;
             }
-            return HasValues(_cache) ? _cache : null;
+            return HasValues(_cache) ? _cache : HasValues(sidecarFallback) ? sidecarFallback : null;
         }
         catch { return HasValues(sidecarFallback) ? sidecarFallback : null; }
     }
 
-    public static void Save(string gameDir, DynamicDaylight dl)
+    public static void Save(DynamicDaylight dl)
     {
         try
         {
-            var path = GlobalPath(gameDir);
+            var path = GlobalPath();
+            if (string.IsNullOrEmpty(path)) return;
             var tmp = path + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(dl, JsonOptions));
             File.Move(tmp, path, true);
