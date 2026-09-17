@@ -35,7 +35,7 @@ static std::string g_techlist_file_path;
 // Bridge protocol: 1 = game-dir signal files (legacy), 2 = data dir below.
 #define RC_PROTOCOL 2
 #define RC_PROTOCOL_STR "2"
-#define RC_ADDON_VERSION "1.0.0"
+#define RC_ADDON_VERSION "1.0.1"
 // Game-dir fallback for transition reads (old plugin still writing there).
 static std::string g_exe_dir;
 static std::atomic<bool> g_refresh_techlist{true};
@@ -1263,6 +1263,11 @@ static void on_init(reshade::api::effect_runtime *runtime)
 	if (sigdir != dir)
 	{
 		// Transition cleanup: stale game-dir signals an old plugin left.
+		// Pause included: the poll thread treats a legacy pause file as a
+		// permanent pause veto the plugin can never clear (it only manages
+		// the primary dir), which wedges "plugin says Running, ReShade
+		// stays paused" forever.
+		delete_file(dir + "\\ffxiv_reshade_pause");
 		delete_file(dir + "\\ffxiv_reshade_preset");
 		delete_file(dir + "\\ffxiv_reshade_anim");
 		delete_file(dir + "\\ffxiv_reshade_state.json");
@@ -1314,10 +1319,32 @@ static void on_present(reshade::api::effect_runtime *runtime)
 	if (runtime == nullptr) return;
 	// One-shot diagnostic: log exactly what effect/technique name strings
 	// ReShade reports, so our matching code never has to guess formats.
+	// Plus the pause boot baseline: file presence vs live runtime state,
+	// so any log proves which side disagrees from the first frame.
 	static bool g_names_dumped = false;
 	if (!g_names_dumped)
 	{
 		g_names_dumped = true;
+		try
+		{
+			bool filePaused = false;
+			try
+			{
+				DWORD pattr = GetFileAttributesA(g_pause_file_path.c_str());
+				filePaused = (pattr != INVALID_FILE_ATTRIBUTES && !(pattr & FILE_ATTRIBUTE_DIRECTORY));
+			}
+			catch (...) {}
+			bool fxOn = false;
+			bool fxKnown = true;
+			try { fxOn = runtime->get_effects_state(); }
+			catch (...) { fxKnown = false; }
+			reshade::log::message(reshade::log::level::info,
+				(std::string("reshade_controller: boot baseline pause-file=") +
+				(filePaused ? "present" : "absent") +
+				" runtime-effects=" +
+				(!fxKnown ? "unknown" : (fxOn ? "on" : "off"))).c_str());
+		}
+		catch (...) {}
 		try
 		{
 			runtime->enumerate_techniques(nullptr, [](reshade::api::effect_runtime *rt, auto technique) {
@@ -1337,17 +1364,110 @@ static void on_present(reshade::api::effect_runtime *runtime)
 	// it applies instantly even mid-reload (per-technique commands below
 	// still wait for reload-done). Technique states are untouched, so a
 	// resume restores exactly what was there.
-	if (g_should_pause.load() != g_paused.load())
+	// The pause FILE is authoritative: reconcile the live runtime state,
+	// not just our shadow. ReShade can be flipped behind our back
+	// (overlay toggle, its own pause key), which left the old
+	// edge-triggered check seeing "in sync" forever: plugin said Running
+	// (file absent) while the runtime stayed paused.
+	// Deferred while a preset reload guard is active: handles/state churn
+	// mid-reload (preset switches don't fire the reload event in 6.8),
+	// so on_reloaded_effects / guard expiry owns pause until calm.
+	bool wantPause = g_should_pause.load();
+	// Heartbeat (1/30s): makes ANY tail decisive. Reports what the bridge
+	// sees even when it takes no action, so "file absent + overlay paused"
+	// distinguishes guard-wedge (guard=1) from getter-lying (actual=0 while
+	// visually paused) from a dead present path (no heartbeat at all).
+	try
 	{
-		try
+		static long long s_lastBeatMs = 0;
+		long long beatNow = steady_ms_now();
+		if (beatNow - s_lastBeatMs > 30000)
 		{
-			bool wantPause = g_should_pause.load();
-			runtime->set_effects_state(!wantPause);
-			g_paused.store(wantPause);
-			reshade::log::message(reshade::log::level::info,
-				wantPause ? "reshade_controller: paused" : "reshade_controller: resumed");
+			s_lastBeatMs = beatNow;
+			bool beatActual = wantPause;
+			bool beatKnown = true;
+			try { beatActual = !runtime->get_effects_state(); }
+			catch (...) { beatKnown = false; }
+			std::string beat = "reshade_controller: pause-heartbeat want=";
+			beat += (wantPause ? "paused" : "running");
+			beat += " actual=";
+			beat += (!beatKnown ? "unknown" : (beatActual ? "paused" : "running"));
+			beat += " guard=";
+			beat += (g_reload_pending.load() ? "1" : "0");
+			try { reshade::log::message(reshade::log::level::info, beat.c_str()); } catch (...) {}
 		}
-		catch (...) {}
+	}
+	catch (...) {}
+	if (g_reload_pending.load())
+	{
+		try { g_paused.store(wantPause); } catch (...) {}
+	}
+	else
+	{
+		static long long s_lastExtLogMs = 0;
+		static long long s_lastErrLogMs = 0;
+		bool actualKnown = true;
+		bool actualPaused = wantPause;
+		try { actualPaused = !runtime->get_effects_state(); }
+		catch (...)
+		{
+			// Fail OPEN, not closed: assuming in-sync here sat paused
+			// forever with zero logging. Enforce the file state and say so.
+			actualKnown = false;
+			actualPaused = !wantPause;
+			long long nowMs = steady_ms_now();
+			if (nowMs - s_lastErrLogMs > 30000)
+			{
+				s_lastErrLogMs = nowMs;
+				try { reshade::log::message(reshade::log::level::error, "reshade_controller: get_effects_state failed, enforcing file state"); } catch (...) {}
+			}
+		}
+		if (actualPaused != wantPause)
+		{
+			bool external = (g_paused.load() == wantPause);
+			bool setOk = true;
+			try { runtime->set_effects_state(!wantPause); }
+			catch (...)
+			{
+				setOk = false;
+				long long nowMs = steady_ms_now();
+				if (nowMs - s_lastErrLogMs > 30000)
+				{
+					s_lastErrLogMs = nowMs;
+					try { reshade::log::message(reshade::log::level::error, "reshade_controller: set_effects_state threw"); } catch (...) {}
+				}
+			}
+			try { g_paused.store(wantPause); } catch (...) {}
+			// Verify the write took: re-read once on this rare path so the
+			// log says whether the runtime obeys or defies us.
+			bool verified = false;
+			if (setOk)
+			{
+				try { verified = (runtime->get_effects_state() == !wantPause); }
+				catch (...) { verified = false; }
+			}
+			// External corrections can fire every present while
+			// something holds the runtime the other way (e.g. manual
+			// overlay unpauses, preset-switch re-enables). Log the
+			// first, then at most one per 5s.
+			long long nowMs = steady_ms_now();
+			bool logIt = !external || (nowMs - s_lastExtLogMs > 5000);
+			if (logIt)
+			{
+				if (external) s_lastExtLogMs = nowMs;
+				std::string msg = external
+					? (wantPause ? "reshade_controller: paused (external state corrected)" : "reshade_controller: resumed (external state corrected)")
+					: (wantPause ? "reshade_controller: paused" : "reshade_controller: resumed");
+				if (!actualKnown) msg += " [state unreadable]";
+				else if (!setOk) msg += " [set threw]";
+				else if (!verified) msg += " [set ignored? re-read disagrees]";
+				try { reshade::log::message(reshade::log::level::info, msg.c_str()); } catch (...) {}
+			}
+		}
+		else if (g_paused.load() != wantPause)
+		{
+			try { g_paused.store(wantPause); } catch (...) {}
+		}
 	}
 
 	// Coalesced preset switch: rapid bursts (clicking through presets,

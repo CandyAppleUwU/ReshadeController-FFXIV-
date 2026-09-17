@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Dalamud.Game.ClientState.Conditions;
@@ -5078,17 +5079,25 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
     // Central pause-file writer: every producer goes through here so an
     // unwritable dir degrades instead of throwing. Returns success.
-    private bool SetPauseFile(bool wantPaused)
+    // Transitions are logged with the caller's name, so dalamud.log always
+    // shows WHO paused/resumed last (globalPause, zone config, QoLBar,
+    // command, hotkey). Steady state never logs.
+    private bool SetPauseFile(bool wantPaused, [CallerMemberName] string caller = "")
     {
         try
         {
             var pauseFile = GetPauseFilePath();
             if (string.IsNullOrEmpty(pauseFile)) return false;
+            bool had = File.Exists(pauseFile);
             if (wantPaused)
             {
-                if (!File.Exists(pauseFile)) File.WriteAllText(pauseFile, "");
+                if (!had) File.WriteAllText(pauseFile, "");
             }
-            else if (File.Exists(pauseFile)) File.Delete(pauseFile);
+            else if (had) File.Delete(pauseFile);
+            if (had != wantPaused)
+            {
+                try { Service.Log.Warning($"[ReshadeController:{DynamicCanvasWindow.BuildTag}] pause {(wantPaused ? "ON" : "OFF")} ({caller})"); } catch { }
+            }
             NoteSignalOk();
             return true;
         }
